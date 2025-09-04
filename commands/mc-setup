@@ -1,190 +1,279 @@
 #!/usr/bin/env bash
-
+set -euo pipefail
 
 . /usr/share/mc-server-tools/lib/common.sh
 require_root
 
-
 # Optional non-interactive flags for automation
-EDITION=""; VERSION=""; HN=""; MEM=""; CORES=""; BKT=""; CTID_IN=""; PORT_IN=""
+EDITION=""; VERSION=""; HN=""; MEM=""; CORES=""; BKT=""; CTID_IN=""; PORT_IN=""; TEMPLATE_IN=""
 while [[ ${1:-} == --* ]]; do
-case "$1" in
---edition) EDITION=${2:?}; shift 2;;
---version) VERSION=${2:?}; shift 2;;
---hostname) HN=${2:?}; shift 2;;
---mem) MEM=${2:?}; shift 2;;
---cores) CORES=${2:?}; shift 2;;
---backup-hhmm) BKT=${2:?}; shift 2;;
---ctid) CTID_IN=${2:?}; shift 2;;
---port) PORT_IN=${2:?}; shift 2;;
---) shift; break;;
-*) err "Unknown flag: $1"; exit 1;;
-esac
+  case "$1" in
+    --edition)       EDITION=${2:?}; shift 2;;
+    --version)       VERSION=${2:?}; shift 2;;
+    --hostname)      HN=${2:?}; shift 2;;
+    --mem)           MEM=${2:?}; shift 2;;
+    --cores)         CORES=${2:?}; shift 2;;
+    --backup-hhmm)   BKT=${2:?}; shift 2;;
+    --ctid)          CTID_IN=${2:?}; shift 2;;
+    --port)          PORT_IN=${2:?}; shift 2;;
+    --template)      TEMPLATE_IN=${2:?}; shift 2;;
+    --) shift; break;;
+    *) err "Unknown flag: $1"; exit 1;;
+  esac
 done
 
-
 echo "=== Minecraft Server Setup ==="
-
 
 # --- helpers ---
 ctid_exists() { pct config "$1" >/dev/null 2>&1; }
 port_in_use_host() { ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
 seed_port() { [[ ${1:-Java} == Bedrock ]] && echo 19132 || echo 25565; }
 
-
 next_free_ctid_port() {
-local start=$1
-local p=$start
-while :; do
-if ! ctid_exists "$p" && ! port_in_use_host "$p"; then
-echo "$p"; return 0
-fi
-p=$((p+1))
-(( p <= 65535 )) || { err "No free CTID/port found above $start"; return 1; }
-done
+  local start=$1
+  local p=$start
+  while :; do
+    if ! ctid_exists "$p" && ! port_in_use_host "$p"; then
+      echo "$p"; return 0
+    fi
+    p=$((p+1))
+    (( p <= 65535 )) || { err "No free CTID/port found above $start"; return 1; }
+  done
 }
 
+TEMPLATE_STATE_FILE="/etc/mc-server-tools/last_template"
+mkdir -p /etc/mc-server-tools
+
+# Collect downloaded templates from local and mounted storages
+collect_templates() {
+  local tlist=()
+  # local storage default path
+  if compgen -G "/var/lib/vz/template/cache/*.tar*" > /dev/null; then
+    for f in /var/lib/vz/template/cache/*.tar*; do
+      tlist+=("local:vztmpl/$(basename "$f")")
+    done
+  fi
+  # mounted storages: /mnt/pve/<store>/template/cache
+  for d in /mnt/pve/*/template/cache; do
+    [[ -d "$d" ]] || continue
+    local stor
+    stor=$(basename "$(dirname "$(dirname "$d")")")
+    for f in "$d"/*.tar*; do
+      [[ -e "$f" ]] || continue
+      tlist+=("${stor}:vztmpl/$(basename "$f")")
+    done
+  done
+  printf '%s\n' "${tlist[@]}"
+}
+
+# Choose default template: last used if present & exists; else prefer Ubuntu 24/22; else first
+choose_template_interactive() {
+  local templates=()
+  mapfile -t templates < <(collect_templates)
+  if [[ ${#templates[@]} -eq 0 ]]; then
+    err "No downloaded LXC templates found. Download one, e.g.:
+  pveam update
+  pveam available | grep ubuntu
+  pveam download local ubuntu-24.04-standard_24.04-1_amd64.tar.zst"; exit 1
+  fi
+
+  local default_idx=0
+  local last=;
+  [[ -f "$TEMPLATE_STATE_FILE" ]] && last=$(<"$TEMPLATE_STATE_FILE") || true
+  # find last in list
+  if [[ -n "$last" ]]; then
+    for i in "${!templates[@]}"; do
+      if [[ "${templates[$i]}" == "$last" ]]; then default_idx=$i; break; fi
+    done
+  else
+    # prefer ubuntu 24/22 if present
+    for i in "${!templates[@]}"; do
+      if [[ "${templates[$i]}" =~ ubuntu-2(4|2)\. ]]; then default_idx=$i; break; fi
+    done
+  fi
+
+  echo "Available downloaded templates:"
+  local i
+  for i in "${!templates[@]}"; do
+    printf "  %2d) %s\n" $((i+1)) "${templates[$i]}"
+  done
+
+  local defnum=$((default_idx+1))
+  local sel
+  read -r -p "Template [$defnum]: " sel
+  sel=${sel:-$defnum}
+
+  local pick
+  if [[ "$sel" =~ ^[0-9]+$ ]]; then
+    (( sel >=1 && sel <= ${#templates[@]} )) || { err "Invalid selection"; exit 1; }
+    pick="${templates[$((sel-1))]}"
+  else
+    # allow typing full storage:vztmpl/file
+    pick="$sel"
+  fi
+
+  echo "$pick"
+}
+
+# Resolve TEMPLATE
+TEMPLATE=""
+if [[ -n "$TEMPLATE_IN" ]]; then
+  TEMPLATE="$TEMPLATE_IN"
+else
+  TEMPLATE=$(choose_template_interactive)
+fi
+
+# Validate template seems plausible (storage:vztmpl/file)
+if [[ ! "$TEMPLATE" =~ ^[^:]+:vztmpl/.+\.tar(\.\w+)?$ ]]; then
+  err "Template must be in the form <storage>:vztmpl/<file.tar.zst>"; exit 1
+fi
+
+# Remember selection
+echo "$TEMPLATE" > "$TEMPLATE_STATE_FILE"
 
 # Edition
 if [[ -z "$EDITION" ]]; then
-read -r -p "Server Edition [Java]: " EDITION
-EDITION=${EDITION:-Java}
+  read -r -p "Server Edition [Java]: " EDITION
+  EDITION=${EDITION:-Java}
 fi
 if [[ $EDITION != "Java" && $EDITION != "Bedrock" ]]; then
-err "Edition must be 'Java' or 'Bedrock'"; exit 1
+  err "Edition must be 'Java' or 'Bedrock'"; exit 1
 fi
-
 
 # Version
 if [[ -z "$VERSION" ]]; then
-read -r -p "Minecraft Version [Latest]: " VERSION
-VERSION=${VERSION:-Latest}
+  read -r -p "Minecraft Version [Latest]: " VERSION
+  VERSION=${VERSION:-Latest}
 fi
-
 
 # Memory
 if [[ -z "$MEM" ]]; then
-read -r -p "Memory (MB) [4096]: " MEM
-MEM=${MEM:-4096}
+  read -r -p "Memory (MB) [4096]: " MEM
+  MEM=${MEM:-4096}
 fi
 [[ "$MEM" =~ ^[0-9]+$ ]] || { err "Memory must be numeric (MB)"; exit 1; }
 
-
 # Cores
 if [[ -z "$CORES" ]]; then
-read -r -p "CPU cores [2]: " CORES
-CORES=${CORES:-2}
+  read -r -p "CPU cores [2]: " CORES
+  CORES=${CORES:-2}
 fi
 [[ "$CORES" =~ ^[0-9]+$ ]] || { err "Cores must be numeric"; exit 1; }
 
-
 # Backup HHMM
 if [[ -z "$BKT" ]]; then
-while true; do
-read -r -p "Daily backup time (HHMM, 24h) [0400]: " BKT
-BKT=${BKT:-0400}
-if validate_hhmm "$BKT"; then break; else warn "Invalid HHMM. Try again."; fi
-done
+  while true; do
+    read -r -p "Daily backup time (HHMM, 24h) [0400]: " BKT
+    BKT=${BKT:-0400}
+    if validate_hhmm "$BKT"; then break; else warn "Invalid HHMM. Try again."; fi
+  done
 else
-validate_hhmm "$BKT" || { err "Invalid --backup-hhmm (use HHMM)"; exit 1; }
+  validate_hhmm "$BKT" || { err "Invalid --backup-hhmm (use HHMM)"; exit 1; }
 fi
-
 
 # --- Auto CTID/Port selection (CTID=Port enforced) ---
 if [[ -n "$CTID_IN" || -n "$PORT_IN" ]]; then
-[[ -z "$CTID_IN" ]] && CTID_IN=$PORT_IN
-[[ -z "$PORT_IN" ]] && PORT_IN=$CTID_IN
-[[ "$CTID_IN" == "$PORT_IN" ]] || { err "CTID and Port must match (CTID=Port policy)."; exit 1; }
-[[ "$CTID_IN" =~ ^[0-9]+$ ]] || { err "CTID/Port must be numeric"; exit 1; }
-(( CTID_IN >= 1 && CTID_IN <= 65535 )) || { err "CTID/Port must be 1-65535"; exit 1; }
-ctid_exists "$CTID_IN" && { err "CTID $CTID_IN already exists"; exit 1; }
-port_in_use_host "$PORT_IN" && { err "Port $PORT_IN is in use on host"; exit 1; }
-CTID=$CTID_IN; PORT=$PORT_IN
+  [[ -z "$CTID_IN" ]] && CTID_IN=$PORT_IN
+  [[ -z "$PORT_IN" ]] && PORT_IN=$CTID_IN
+  [[ "$CTID_IN" == "$PORT_IN" ]] || { err "CTID and Port must match (CTID=Port policy)."; exit 1; }
+  [[ "$CTID_IN" =~ ^[0-9]+$ ]] || { err "CTID/Port must be numeric"; exit 1; }
+  (( CTID_IN >= 1 && CTID_IN <= 65535 )) || { err "CTID/Port must be 1-65535"; exit 1; }
+  ctid_exists "$CTID_IN" && { err "CTID $CTID_IN already exists"; exit 1; }
+  port_in_use_host "$PORT_IN" && { err "Port $PORT_IN is in use on host"; exit 1; }
+  CTID=$CTID_IN; PORT=$PORT_IN
 else
-SEED=$(seed_port "$EDITION")
-PICK=$(next_free_ctid_port "$SEED")
-CTID=$PICK; PORT=$PICK
+  SEED=$(seed_port "$EDITION")
+  PICK=$(next_free_ctid_port "$SEED")
+  CTID=$PICK; PORT=$PICK
 fi
-
 
 # Hostname (default ties to CTID/Port)
 if [[ -z "$HN" ]]; then
-read -r -p "Hostname [mc-$CTID]: " HN
-HN=${HN:-mc-$CTID}
+  read -r -p "Hostname [mc-$CTID]: " HN
+  HN=${HN:-mc-$CTID}
 fi
 
-
 info "Summary"
-echo "CTID: $CTID"
-echo "Hostname: $HN"
-echo "Edition: $EDITION"
-echo "Version: $VERSION"
-echo "Memory: ${MEM}MB"
-echo "Cores: $CORES"
-echo "Network: Bridge (default)"
-echo "Port: $PORT (CTID=Port policy)"
+echo "CTID:      $CTID"
+echo "Hostname:  $HN"
+echo "Edition:   $EDITION"
+echo "Version:   $VERSION"
+echo "Template:  $TEMPLATE"
+echo "Memory:    ${MEM}MB"
+echo "Cores:     $CORES"
+echo "Network:   Bridge (default)"
+echo "Port:      $PORT (CTID=Port policy)"
 echo "Autostart: Yes (always)"
-echo "Backups: Daily @ ${BKT:0:2}:${BKT:2:2}"
+echo "Backups:   Daily @ ${BKT:0:2}:${BKT:2:2}"
 
 # --- Create LXC ---
-TEMPLATE=$(ubuntu_template)
-if [[ -z "$TEMPLATE" ]]; then err "No Ubuntu template found via pveam."; exit 1; fi
 info "Using template: $TEMPLATE"
 
-
-# Storage detection: pick 'local-lvm' if present else 'local'
+# Storage detection for rootfs: pick 'local-lvm' if present else 'local'
 STOR=$(pvesh get /storage 2>/dev/null | awk '/local-lvm/{print $2}' | head -n1)
 STOR=${STOR:-local}
 
-
 info "Creating container CT $CTID..."
 pct create "$CTID" "$TEMPLATE" \
--hostname "$HN" \
--cores "$CORES" \
--memory "$MEM" \
--swap 0 \
--net0 "name=eth0,bridge=vmbr0,ip=dhcp" \
--rootfs "$STOR:8" \
--unprivileged 1 \
--onboot 1
-
+  -hostname "$HN" \
+  -cores "$CORES" \
+  -memory "$MEM" \
+  -swap 0 \
+  -net0 "name=eth0,bridge=vmbr0,ip=dhcp" \
+  -rootfs "$STOR:8" \
+  -unprivileged 1 \
+  -onboot 1
 
 info "Starting CT $CTID..."; pct start "$CTID"
 
-
 if [[ $EDITION == "Java" ]]; then
-info "Installing Java and server jar..."
-pct exec "$CTID" -- bash -lc 'apt-get update && apt-get install -y openjdk-21-jre-headless curl screen && \
-useradd -m -s /bin/bash mc || true && \
-install -d -o mc -g mc /opt/minecraft && cd /opt/minecraft && \
-curl -fsSL -o server.jar https://launcher.mojang.com/v1/objects/fe9f03f1f2b44f2d6a6f1a/server.jar || true && \
-echo "eula=true" > /opt/minecraft/eula.txt && chown -R mc:mc /opt/minecraft'
+  info "Installing Java and server jar..."
+  pct exec "$CTID" -- bash -lc 'apt-get update && apt-get install -y openjdk-21-jre-headless curl screen && \
+    useradd -m -s /bin/bash mc || true && \
+    install -d -o mc -g mc /opt/minecraft && cd /opt/minecraft && \
+    curl -fsSL -o server.jar https://launcher.mojang.com/v1/objects/fe9f03f1f2b44f2d6a6f1a/server.jar || true && \
+    echo "eula=true" > /opt/minecraft/eula.txt && chown -R mc:mc /opt/minecraft'
 
+  info "Creating start script and service..."
+  pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start <<\"EOS\"
+#!/usr/bin/env bash
+set -e
+cd /opt/minecraft
+su -s /bin/bash - mc -c "screen -dmS mc java -Xms512M -Xmx'"$MEM"'M -jar server.jar nogui"
+EOS
+chmod +x /usr/local/bin/mc-start'
 
-info "Creating start script and service..."
-pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start <<"EOS"\n#!/usr/bin/env bash\nset -e\ncd /opt/minecraft\nsu -s /bin/bash - mc -c "screen -dmS mc java -Xms512M -Xmx'"$MEM"'M -jar server.jar nogui"\nEOS\nchmod +x /usr/local/bin/mc-start'
+  pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service <<EOF
+[Unit]
+Description=Minecraft Server
+After=network.target
 
+[Service]
+Type=forking
+User=root
+ExecStart=/usr/local/bin/mc-start
+Restart=on-failure
 
-pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service <<EOF\n[Unit]\nDescription=Minecraft Server\nAfter=network.target\n\n[Service]\nType=forking\nUser=root\nExecStart=/usr/local/bin/mc-start\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\nEOF\n'
+[Install]
+WantedBy=multi-user.target
+EOF
+'
 
-
-pct exec "$CTID" -- systemctl enable minecraft.service
+  pct exec "$CTID" -- systemctl enable minecraft.service
 else
-info "Setting up Bedrock (beta minimal)"
-pct exec "$CTID" -- bash -lc 'apt-get update && apt-get install -y unzip curl && \
-useradd -m -s /bin/bash mc || true && \
-install -d -o mc -g mc /opt/bedrock && cd /opt/bedrock && \
-curl -fsSL -o bedrock-server.zip https://minecraft.net/en-us/download/server/bedrock && \
-unzip -o bedrock-server.zip && chown -R mc:mc /opt/bedrock'
-# TODO: create a systemd service similar to Java
+  info "Setting up Bedrock (beta minimal)"
+  pct exec "$CTID" -- bash -lc 'apt-get update && apt-get install -y unzip curl && \
+    useradd -m -s /bin/bash mc || true && \
+    install -d -o mc -g mc /opt/bedrock && cd /opt/bedrock && \
+    curl -fsSL -o bedrock-server.zip https://minecraft.net/en-us/download/server/bedrock && \
+    unzip -o bedrock-server.zip && chown -R mc:mc /opt/bedrock'
+  # TODO: create a systemd service similar to Java
 fi
-
 
 # --- Backups via host cron (vzdump) ---
 H=${BKT:0:2}; M=${BKT:2:2}
 CRONFILE="/etc/cron.d/mc-server-${CTID}"
 echo "$M $H * * * root /usr/bin/mc backup $CTID" > "$CRONFILE"
 chmod 0644 "$CRONFILE"
-
 
 info "Done! Use: mc start $CTID | mc logs $CTID | mc console $CTID | mc backup $CTID | mc list"
