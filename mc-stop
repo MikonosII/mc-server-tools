@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+CTID=${1:?"Usage: mc stop <CTID>"}
+
+
+# Attempt to gracefully stop Minecraft service inside the CT first
+pct exec "$CTID" -- systemctl stop minecraft.service 2>/dev/null || true
+
+
+# Then stop the container itself
+pct stop "$CTID"
+
+
+echo "CT $CTID stopped"
