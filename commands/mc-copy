@@ -4,7 +4,7 @@ set -euo pipefail
 require_root
 
 SRC=${1:?'Usage: mc copy <SRC_CTID> [--storage NAME] [--disk-gb N] [--mem MB] [--cores N] [--backup-hhmm HHMM] [--version STR] [--template STORAGE:vztmpl/file]'}
-shift
+shift || true
 
 # Optional pass-through flags
 STORAGE_IN=""; DISK_GB_IN=""; MEM_IN=""; CORES_IN=""; BKT_IN=""; VERSION_IN=""; TEMPLATE_IN=""
@@ -24,7 +24,7 @@ done
 
 pct config "$SRC" >/dev/null || { err "Source CT $SRC not found"; exit 1; }
 
-# --- helpers (local copies to avoid depending on mc-setup internals) ---
+# --- helpers (standalone) ---
 ctid_exists() { pct config "$1" >/dev/null 2>&1; }
 port_in_use_host() { ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
 seed_port() { [[ $1 == Bedrock ]] && echo 19132 || echo 25565; }
@@ -36,7 +36,7 @@ next_free_ctid_port() {
   done
 }
 
-# Pick a non-interactive template (last used > ubuntu24/22 > first found)
+# Parse a sensible default template (last used > ubuntu 24/22 > first found)
 TEMPLATE_STATE_FILE="/etc/mc-server-tools/last_template"
 collect_templates() {
   local tlist=()
@@ -61,13 +61,13 @@ default_template() {
   echo "${templates[0]}"
 }
 
-# --- Detect edition in source ---
+# Extract source edition
 if pct exec "$SRC" -- test -d /opt/minecraft 2>/dev/null; then
   TYPE="Java"; SRC_WORLD_ROOT="/opt/minecraft"
 elif pct exec "$SRC" -- test -d /opt/bedrock/worlds 2>/dev/null; then
   TYPE="Bedrock"; SRC_WORLD_ROOT="/opt/bedrock"
 else
-  err "Could not detect world directory in CT $SRC (expect /opt/minecraft or /opt/bedrock/worlds)"; exit 1
+  err "Could not detect world directory in CT $SRC (expected /opt/minecraft or /opt/bedrock/worlds)"; exit 1
 fi
 
 # Mirror resources from source (fallbacks)
@@ -75,6 +75,24 @@ SRC_MEM=$(pct config "$SRC" | awk -F': ' '/^memory:/{print $2}')
 SRC_CORES=$(pct config "$SRC" | awk -F': ' '/^cores:/{print $2}')
 SRC_MEM=${SRC_MEM:-4096}
 SRC_CORES=${SRC_CORES:-2}
+
+# Read source disk size from rootfs line (default to 8G if unknown)
+get_src_disk_gb() {
+  local line size num unit
+  line=$(pct config "$SRC" | awk -F': ' '/^rootfs:/{print $2}')
+  # Common form: "<storage>:subvol-XXX,size=12G"
+  if [[ "$line" =~ size=([0-9]+)([GgMmKk]) ]]; then
+    num=${BASH_REMATCH[1]}; unit=${BASH_REMATCH[2]}
+    case "$unit" in
+      G|g) echo "$num"; return 0;;
+      M|m) echo $(( (num + 1023) / 1024 )); return 0;;
+      K|k) echo $(( (num + 1048575) / 1048576 )); return 0;;
+    esac
+  fi
+  # Fallback if no size tag found
+  echo 8
+}
+SRC_DISK_GB=$(get_src_disk_gb)
 
 # Destination CTID=Port (auto)
 DST=$(next_free_ctid_port "$(seed_port "$TYPE")")
@@ -87,7 +105,22 @@ fi
 # Ensure a backup time is supplied to avoid prompting
 BKT_IN=${BKT_IN:-0400}
 
-info "Creating destination CT $DST via mc setup (edition: $TYPE, thin-provisioned)..."
+# Decide destination disk size: mirror or increase
+DEST_DISK_GB="$SRC_DISK_GB"
+if [[ -n "$DISK_GB_IN" ]]; then
+  if [[ "$DISK_GB_IN" =~ ^[0-9]+$ ]]; then
+    if (( DISK_GB_IN < SRC_DISK_GB )); then
+      warn "Requested --disk-gb ($DISK_GB_IN) is smaller than source ($SRC_DISK_GB). Using $SRC_DISK_GB instead."
+      DEST_DISK_GB="$SRC_DISK_GB"
+    else
+      DEST_DISK_GB="$DISK_GB_IN"
+    fi
+  else
+    warn "Ignoring invalid --disk-gb value '$DISK_GB_IN'; defaulting to source size $SRC_DISK_GB."
+  fi
+fi
+
+info "Creating destination CT $DST via mc setup (edition: $TYPE, thin-provisioned, disk ${DEST_DISK_GB}G)..."
 /usr/bin/mc setup \
   --edition "$TYPE" \
   --version "${VERSION_IN:-Latest}" \
@@ -96,8 +129,8 @@ info "Creating destination CT $DST via mc setup (edition: $TYPE, thin-provisione
   --cores "${CORES_IN:-$SRC_CORES}" \
   --backup-hhmm "$BKT_IN" \
   --template "$TEMPLATE_IN" \
-  ${STORAGE_IN:+--storage "$STORAGE_IN"} \
-  ${DISK_GB_IN:+--disk-gb "$DISK_GB_IN"}
+  --disk-gb "$DEST_DISK_GB" \
+  ${STORAGE_IN:+--storage "$STORAGE_IN"}
 
 # Stop destination service to safely copy world data
 pct exec "$DST" -- systemctl stop minecraft.service 2>/dev/null || true
@@ -114,5 +147,5 @@ fi
 # Start destination server
 pct exec "$DST" -- systemctl start minecraft.service 2>/dev/null || true
 
-info "Copy complete. New CTID=Port: $DST (Edition: $TYPE)"
+info "Copy complete. New CTID=Port: $DST (Edition: $TYPE, Disk: ${DEST_DISK_GB}G)"
 info "Use: mc start $DST | mc console $DST | mc logs $DST"
