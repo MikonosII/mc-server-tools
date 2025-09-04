@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+. /usr/share/mc-server-tools/lib/common.sh
+require_root
+
+
+SRC=${1:?'Usage: mc copy <SRC_CTID>'}
+
+
+pct config "$SRC" >/dev/null || { err "Source CT $SRC not found"; exit 1; }
+
+
+# Detect edition in source
+if pct exec "$SRC" -- test -d /opt/minecraft; then
+TYPE="Java"; SEED=25565; SRC_WORLD_ROOT="/opt/minecraft"
+elif pct exec "$SRC" -- test -d /opt/bedrock/worlds; then
+TYPE="Bedrock"; SEED=19132; SRC_WORLD_ROOT="/opt/bedrock"
+else
+err "Could not detect world directory in CT $SRC"; exit 1
+fi
+
+
+# Mirror resources
+SRC_MEM=$(pct config "$SRC" | awk -F': ' '/^memory:/{print $2}')
+SRC_CORES=$(pct config "$SRC" | awk -F': ' '/^cores:/{print $2}')
+SRC_MEM=${SRC_MEM:-4096}
+SRC_CORES=${SRC_CORES:-2}
+
+
+# Pick next free CTID=Port for copy
+DST=$(next_free_ctid_port "$SEED")
+
+
+info "Creating destination CT $DST via mc setup (edition: $TYPE)..."
+/usr/bin/mc setup \
+--edition "$TYPE" \
+--version Latest \
+--ctid "$DST" \
+--hostname "mc-$DST" \
+--mem "$SRC_MEM" \
+--cores "$SRC_CORES" \
+--backup-hhmm 0400
+
+
+# Stop service before copy
+pct exec "$DST" -- systemctl stop minecraft.service 2>/dev/null || true
+
+
+info "Copying world data from $SRC to $DST..."
+if [[ $TYPE == "Java" ]]; then
+pct exec "$SRC" -- bash -lc "cd /opt/minecraft && tar -cf - $(ls -d world* 2>/dev/null || true)" \
+| pct exec "$DST" -- bash -lc "mkdir -p /opt/minecraft && tar -xf - -C /opt/minecraft && chown -R mc:mc /opt/minecraft/world* || true"
+else
+pct exec "$SRC" -- bash -lc "cd /opt/bedrock && tar -cf - worlds" \
+| pct exec "$DST" -- bash -lc "mkdir -p /opt/bedrock && tar -xf - -C /opt/bedrock && chown -R mc:mc /opt/bedrock/worlds"
+fi
+
+
+# Restart service
+pct exec "$DST" -- systemctl start minecraft.service 2>/dev/null || true
+
+
+info "Copy complete. New CTID=Port: $DST (Edition: $TYPE)"
+info "Use: mc start $DST | mc console $DST | mc logs $DST"
