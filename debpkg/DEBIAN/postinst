@@ -1,13 +1,19 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -e
 
-# Ensure correct permissions on installed files
-chmod 0755 /usr/bin/mc || true
-chmod 0755 /usr/share/mc-server-tools/commands/* || true
+# Ensure runtime/state dirs exist
+install -d -m0755 /etc/mc-server-tools
+install -d -m0755 /var/lib/mc-server-tools
 
-# Print helpful hint after installation
-cat <<'EON'
-mc-server-tools installed.
+# Preserve existing config if admin already customized it (dpkg conffile handles merges)
+if [ ! -f /etc/mc-server-tools/config ]; then
+  echo "WARN: /etc/mc-server-tools/config missing; reinstall may have skipped. Creating empty file."
+  : > /etc/mc-server-tools/config
+fi
 
-Run: mc setup    # to create your first server
-EON
+# Make sure primary entrypoint is executable
+chmod 0755 /usr/bin/mc 2>/dev/null || true
+
+# Friendly note
+echo "mc-server-tools installed. Try: mc setup"
+exit 0
