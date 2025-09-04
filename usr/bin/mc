@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mc — dispatcher for mc-server-tools
+# Commands live in: /usr/share/mc-server-tools/commands
+
+CMDDIR="${MC_CMDDIR:-/usr/share/mc-server-tools/commands}"
+PROG="mc"
+
+show_help() {
+  cat <<'EOF'
+mc <command> [options]
+
+Commands:
+  setup       Create a new Minecraft server CT
+  start       Start a server (mc start <CTID>)
+  stop        Stop a server (mc stop <CTID>)
+  restart     Restart a server (mc restart <CTID>)
+  console     Attach to a server console (mc console <CTID>)
+  logs        Show server logs (mc logs <CTID>)
+  backup      Run a manual backup (mc backup <CTID>)
+  list        List Minecraft servers
+  copy        Create a new CT by copying worlds from an existing one
+  new         Archive the current world and generate a fresh one (mc new <CTID> [--seed SEED])
+  help        Show this help message
+
+Environment:
+  MC_CMDDIR   Override the commands directory (default: /usr/share/mc-server-tools/commands)
+EOF
+}
+
+COMMAND="${1:-}"
+if [[ -z "${COMMAND}" || "${COMMAND}" == "-h" || "${COMMAND}" == "--help" || "${COMMAND}" == "help" ]]; then
+  show_help
+  exit 0
+fi
+shift || true
+
+case "${COMMAND}" in
+  setup|start|stop|restart|console|logs|backup|list|copy|new)
+    CMDPATH="${CMDDIR}/mc-${COMMAND}"
+    if [[ ! -x "${CMDPATH}" ]]; then
+      echo "Error: command '${COMMAND}' not found at ${CMDPATH}" >&2
+      exit 127
+    fi
+    exec "${CMDPATH}" "$@"
+    ;;
+  *)
+    echo "Unknown command: ${COMMAND}" >&2
+    echo "Run 'mc help' for usage." >&2
+    exit 1
+    ;;
+esac
