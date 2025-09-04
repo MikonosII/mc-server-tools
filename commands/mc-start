@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+CTID=${1:?"Usage: mc start <CTID>"}
+
+
+pct start "$CTID"
+
+
+# If a systemd Minecraft service exists inside the CT, start it
+pct exec "$CTID" -- systemctl start minecraft.service 2>/dev/null || true
+
+
+echo "CT $CTID started"
