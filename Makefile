@@ -7,6 +7,9 @@ PKGNAME := mc-server-tools-$(VERSION)
 install:
 	install -d $(SHARE)/{bin,lib,scripts,systemd,config}
 	install -d /etc/mc-server-tools/servers
+	install -d $(DESTDIR)/etc/mc-server-tools
+	install -m0644 config/etc/mc-server-tools/config \
+			$(DESTDIR)/etc/mc-server-tools/config
 	install -m 0755 bin/mc $(BIN)/mc
 	cp -r lib $(SHARE)/
 	cp -r scripts $(SHARE)/
