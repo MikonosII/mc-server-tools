@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Reset world in an existing CT, archiving the old world first.
+# Usage: mc new <CTID> [--seed <SEED>]
+#
+# - Auto-detects Java (/opt/minecraft) vs Bedrock (/opt/bedrock)
+# - Stops minecraft.service, archives current world with timestamp, removes it,
+#   sets a new level seed (random if not provided), and restarts
+# - Runs as mcadmin; keeps backups inside the CT
+
+. /usr/share/mc-server-tools/lib/common.sh
+require_root
+
+CTID=${1:-}
+shift || true
+
+SEED=""
+while [[ ${1:-} == --* ]]; do
+  case "$1" in
+    --seed) SEED=${2:?}; shift 2;;
+    --) shift; break;;
+    *) err "Unknown option: $1"; exit 1;;
+  esac
+done
+
+[[ -n "$CTID" ]] || { err "Usage: mc new <CTID> [--seed SEED]"; exit 1; }
+pct config "$CTID" >/dev/null 2>&1 || { err "CT $CTID not found"; exit 1; }
+
+# Generate a random seed if not provided (safe 32-bit signed range 1..2147483647)
+if [[ -z "$SEED" ]]; then
+  SEED=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
+  SEED=$(( (SEED % 2147483647) + 1 ))
+fi
+
+# Detect edition by presence of known paths
+if pct exec "$CTID" -- test -d /opt/minecraft 2>/dev/null; then
+  EDITION="Java"
+elif pct exec "$CTID" -- test -d /opt/bedrock 2>/dev/null; then
+  EDITION="Bedrock"
+else
+  err "Could not detect edition in CT $CTID (expected /opt/minecraft or /opt/bedrock)."
+  exit 1
+fi
+
+info "CT $CTID detected as $EDITION. New seed will be: $SEED"
+pct exec "$CTID" -- systemctl stop minecraft.service 2>/dev/null || true
+
+if [[ "$EDITION" == "Java" ]]; then
+  pct exec "$CTID" -- bash -lc "
+    set -euo pipefail
+    USER=mcadmin
+    ROOT=/opt/minecraft
+    PROPS=\$ROOT/server.properties
+    mkdir -p \"\$ROOT\"; touch \"\$PROPS\"
+    chown -R \$USER:\$USER \"\$ROOT\"
+
+    LEVEL_NAME=\$(sed -n 's/^level-name=//p' \"\$PROPS\" | head -n1 || true)
+    [ -z \"\$LEVEL_NAME\" ] && LEVEL_NAME=world
+
+    TS=\$(date +%Y%m%d-%H%M%S)
+    BKDIR=\$ROOT/world-backups
+    mkdir -p \"\$BKDIR\"
+    cd \"\$ROOT\"
+
+    TO_BACKUP=()
+    [ -d \"\$LEVEL_NAME\" ] && TO_BACKUP+=(\"\$LEVEL_NAME\")
+    [ -d \"\${LEVEL_NAME}_nether\" ] && TO_BACKUP+=(\"\${LEVEL_NAME}_nether\")
+    [ -d \"\${LEVEL_NAME}_the_end\" ] && TO_BACKUP+=(\"\${LEVEL_NAME}_the_end\")
+
+    if [ \${#TO_BACKUP[@]} -gt 0 ]; then
+      if command -v zstd >/dev/null 2>&1; then
+        tar -cf - \"\${TO_BACKUP[@]}\" | zstd -T0 -19 -o \"\$BKDIR/\${LEVEL_NAME}-\${TS}.tar.zst\"
+      else
+        tar -czf \"\$BKDIR/\${LEVEL_NAME}-\${TS}.tar.gz\" \"\${TO_BACKUP[@]}\"
+      fi
+      chown -R \$USER:\$USER \"\$BKDIR\"
+    fi
+
+    # Remove old world dirs
+    for d in \"\${TO_BACKUP[@]}\"; do rm -rf -- \"\$d\"; done
+
+    # Write new seed (random from host if not provided)
+    if grep -q '^level-seed=' \"\$PROPS\" 2>/dev/null; then
+      sed -i 's/^level-seed=.*/level-seed=${SEED//\//\\/}/' \"\$PROPS\"
+    else
+      printf '\\nlevel-seed=%s\\n' \"${SEED}\" >> \"\$PROPS\"
+    fi
+
+    chown -R \$USER:\$USER \"\$ROOT\"
+  "
+
+else
+  pct exec "$CTID" -- bash -lc "
+    set -euo pipefail
+    USER=mcadmin
+    ROOT=/opt/bedrock
+    PROPS=\$ROOT/server.properties
+    WORLDS=\$ROOT/worlds
+
+    mkdir -p \"\$ROOT\" \"\$WORLDS\"
+    touch \"\$PROPS\"
+    chown -R \$USER:\$USER \"\$ROOT\"
+
+    LEVEL_NAME=\$(sed -n 's/^level-name=//p' \"\$PROPS\" | head -n1 || true)
+    [ -z \"\$LEVEL_NAME\" ] && LEVEL_NAME='Bedrock level'
+
+    TS=\$(date +%Y%m%d-%H%M%S)
+    BKDIR=\$ROOT/worlds-backups
+    mkdir -p \"\$BKDIR\"
+    cd \"\$WORLDS\"
+
+    if [ -d \"\$LEVEL_NAME\" ]; then
+      if command -v zstd >/dev/null 2>&1; then
+        tar -cf - \"\$LEVEL_NAME\" | zstd -T0 -19 -o \"\$BKDIR/\${LEVEL_NAME// /_}-\${TS}.tar.zst\"
+      else
+        tar -czf \"\$BKDIR/\${LEVEL_NAME// /_}-\${TS}.tar.gz\" \"\$LEVEL_NAME\"
+      fi
+      chown -R \$USER:\$USER \"\$BKDIR\"
+      rm -rf -- \"\$LEVEL_NAME\"
+    fi
+
+    # Write new seed (random from host if not provided)
+    if grep -q '^level-seed=' \"\$PROPS\" 2>/dev/null; then
+      sed -i 's/^level-seed=.*/level-seed=${SEED//\//\\/}/' \"\$PROPS\"
+    else
+      printf '\\nlevel-seed=%s\\n' \"${SEED}\" >> \"\$PROPS\"
+    fi
+
+    chown -R \$USER:\$USER \"\$ROOT\"
+  "
+fi
+
+pct exec "$CTID" -- systemctl start minecraft.service 2>/dev/null || true
+
+info "World reset complete on CT $CTID (${EDITION})."
+info "New seed: $SEED"
+if [[ "$EDITION" == "Java" ]]; then
+  info "Backups stored under: /opt/minecraft/world-backups (inside CT)"
+else
+  info "Backups stored under: /opt/bedrock/worlds-backups (inside CT)"
+fi
