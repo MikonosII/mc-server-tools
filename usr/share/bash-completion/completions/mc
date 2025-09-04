@@ -1,0 +1,35 @@
+# bash completion for mc
+# Installs to: /usr/share/bash-completion/completions/mc
+# Subcommands + common flags, plus CTID completion via `pct list`
+
+_mc() {
+  local cur prev words cword
+  _init_completion || return
+
+  local subcmds="setup start stop restart console logs backup list copy new help"
+
+  # subcommand position
+  if (( COMP_CWORD == 1 )); then
+    COMPREPLY=( $(compgen -W "$subcmds" -- "$cur") )
+    return
+  fi
+
+  case "${COMP_WORDS[1]}" in
+    start|stop|restart|console|logs|backup|new|copy)
+      # complete CTIDs
+      local ids
+      ids="$(pct list 2>/dev/null | awk 'NR>1{print $1}')"
+      COMPREPLY=( $(compgen -W "$ids" -- "$cur") )
+      ;;
+    setup)
+      COMPREPLY=( $(compgen -W "--edition --version --mem --cores --backup-hhmm --ctid --port --template --disk-gb --storage" -- "$cur") )
+      ;;
+    copy)
+      COMPREPLY=( $(compgen -W "--storage --disk-gb --mem --cores --backup-hhmm --version --template" -- "$cur") )
+      ;;
+    new)
+      COMPREPLY=( $(compgen -W "--seed" -- "$cur") )
+      ;;
+  esac
+}
+complete -F _mc mc
