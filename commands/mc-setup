@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# CTID
+DEFAULT_CTID=$(next_ctid 101)
+if [[ -z "$CTID_IN" ]]; then
+read -r -p "CTID [$DEFAULT_CTID]: " CTID
+CTID=${CTID:-$DEFAULT_CTID}
+else
+CTID=$CTID_IN
+fi
+
+
+# Hostname
+if [[ -z "$HN" ]]; then
+read -r -p "Hostname [mc-$CTID]: " HN
+HN=${HN:-mc-$CTID}
+fi
+
+
+# Memory
+if [[ -z "$MEM" ]]; then
+read -r -p "Memory (MB) [4096]: " MEM
+MEM=${MEM:-4096}
+fi
+
+
+# Cores
+if [[ -z "$CORES" ]]; then
+read -r -p "CPU cores [2]: " CORES
+CORES=${CORES:-2}
+fi
+
+
+# Port
+if [[ -z "$PORT" ]]; then
+PORT_DEFAULT=$(find_free_port 25565)
+read -r -p "Minecraft Port [$PORT_DEFAULT]: " PORT
+PORT=${PORT:-$PORT_DEFAULT}
+fi
+
+
+# Backup HHMM
+if [[ -z "$BKT" ]]; then
+while true; do
+read -r -p "Daily backup time (HHMM, 24h) [0400]: " BKT
+BKT=${BKT:-0400}
+if validate_hhmm "$BKT"; then break; else warn "Invalid HHMM. Try again."; fi
+done
+else
+validate_hhmm "$BKT" || { err "Invalid --backup-hhmm (use HHMM)"; exit 1; }
+fi
+
+
+info "Summary"
+echo "CTID: $CTID"
+echo "Hostname: $HN"
+echo "Edition: $EDITION"
+echo "Version: $VERSION"
+echo "Memory: ${MEM}MB"
+echo "Cores: $CORES"
+echo "Network: Bridge (default)"
+echo "Port: $PORT"
+echo "Autostart: Yes (always)"
+echo "Backups: Daily @ ${BKT:0:2}:${BKT:2:2}"
+
+
+if [[ -z "$YES" ]]; then
+read -r -p "Proceed with install [Y/n]: " GO
+GO=${GO:-Y}
+if [[ ! $GO =~ ^[Yy]$ ]]; then exit 0; fi
+fi
+
+
+# --- Create LXC ---
+TEMPLATE=$(ubuntu_template)
+if [[ -z "$TEMPLATE" ]]; then err "No Ubuntu template found via pveam."; exit 1; fi
+info "Using template: $TEMPLATE"
+
+
+# Storage detection: pick 'local-lvm' if present else 'local'
+STOR=$(pvesh get /storage 2>/dev/null | awk '/local-lvm/{print $2}' | head -n1)
+STOR=${STOR:-local}
+
+
+info "Creating container CT $CTID..."
+pct create "$CTID" "$TEMPLATE" \
+-hostname "$HN" \
+-cores "$CORES" \
+-memory "$MEM" \
+-swap 0 \
+-net0 "name=eth0,bridge=vmbr0,ip=dhcp" \
+-rootfs "$STOR:8" \
+-unprivileged 1 \
+-onboot 1
+
+
+info "Starting CT $CTID..."; pct start "$CTID"
+
+
+if [[ $EDITION == "Java" ]]; then
+info "Installing Java and server jar..."
+pct exec "$CTID" -- bash -lc 'apt-get update && apt-get install -y openjdk-21-jre-headless curl screen && \
+useradd -m -s /bin/bash mc || true && \
+install -d -o mc -g mc /opt/minecraft && cd /opt/minecraft && \
+curl -fsSL -o server.jar https://launcher.mojang.com/v1/objects/fe9f03f1f2b44f2d6a6f1a/server.jar || true && \
+echo "eula=true" > /opt/minecraft/eula.txt && chown -R mc:mc /opt/minecraft'
+
+
+info "Creating start script and service..."
+pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start <<"EOS"\n#!/usr/bin/env bash\nset -e\ncd /opt/minecraft\nsu -s /bin/bash - mc -c "screen -dmS mc java -Xms512M -Xmx'"$MEM"'M -jar server.jar nogui"\nEOS\nchmod +x /usr/local/bin/mc-start'
+
+
+pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service <<EOF\n[Unit]\nDescription=Minecraft Server\nAfter=network.target\n\n[Service]\nType=forking\nUser=root\nExecStart=/usr/local/bin/mc-start\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\nEOF\n'
+
+
+pct exec "$CTID" -- systemctl enable minecraft.service
+else
+info "Setting up Bedrock (beta minimal)"
+pct exec "$CTID" -- bash -lc 'apt-get update && apt-get install -y unzip curl && \
+useradd -m -s /bin/bash mc || true && \
+install -d -o mc -g mc /opt/bedrock && cd /opt/bedrock && \
+curl -fsSL -o bedrock-server.zip https://minecraft.net/en-us/download/server/bedrock && \
+unzip -o bedrock-server.zip && chown -R mc:mc /opt/bedrock'
+# TODO: create a systemd service similar to Java
+fi
+
+
+# --- Backups via host cron (vzdump) ---
+H=${BKT:0:2}; M=${BKT:2:2}
+CRONFILE="/etc/cron.d/mc-server-${CTID}"
+echo "$M $H * * * root /usr/bin/mc backup $CTID" > "$CRONFILE"
+chmod 0644 "$CRONFILE"
+
+
+info "Done! Use: mc start $CTID | mc logs $CTID | mc console $CTID | mc backup $CTID | mc list"
