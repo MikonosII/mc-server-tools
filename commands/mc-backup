@@ -1,1 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
 
+
+usage() {
+cat <<'EOF'
+Usage: mc backup <CTID> [--dumpdir PATH] [--compress zstd|lz4|gzip] [--mode snapshot|suspend|stop]
+
+
+Creates a Proxmox vzdump backup for the given container.
+Defaults: --dumpdir /var/lib/vz/dump --compress zstd --mode snapshot
+EOF
+}
+
+
+CTID=${1:-}
+[[ -n "$CTID" && "$CTID" != --* ]] || { usage; exit 1; }
+shift || true
+
+
+DUMPDIR="/var/lib/vz/dump"
+COMPRESS="zstd"
+MODE="snapshot"
+
+
+while [[ ${1:-} == --* ]]; do
+case "$1" in
+--dumpdir) DUMPDIR=${2:?}; shift 2;;
+--compress) COMPRESS=${2:?}; shift 2;;
+--mode) MODE=${2:?}; shift 2;;
+-h|--help) usage; exit 0;;
+*) echo "Unknown option: $1" >&2; usage; exit 1;;
+esac
+done
+
+
+# Ensure dump directory exists
+mkdir -p "$DUMPDIR"
+
+
+# Validate dependencies
+command -v vzdump >/dev/null 2>&1 || { echo "vzdump not found (install proxmox backup tools)" >&2; exit 1; }
+
+
+# Do not remove old backups automatically; leave retention to admin or a prune task
+vzdump "$CTID" \
+--dumpdir "$DUMPDIR" \
+--compress "$COMPRESS" \
+--mode "$MODE" \
+--remove 0
+
+
+# Best-effort: list newest backup for this CTID
+LATEST=$(ls -1t "$DUMPDIR"/vzdump-lxc-${CTID}-*.{zst,lzo,gz} 2>/dev/null | head -n1 || true)
+if [[ -n "$LATEST" ]]; then
+echo "Backup complete: $LATEST"
+else
+echo "Backup complete. Files are in $DUMPDIR"
+fi
