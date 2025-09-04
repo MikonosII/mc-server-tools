@@ -1,18 +1,64 @@
 #!/usr/bin/env bash
-# CTID
-DEFAULT_CTID=$(next_ctid 101)
-if [[ -z "$CTID_IN" ]]; then
-read -r -p "CTID [$DEFAULT_CTID]: " CTID
-CTID=${CTID:-$DEFAULT_CTID}
-else
-CTID=$CTID_IN
+
+
+. /usr/share/mc-server-tools/lib/common.sh
+require_root
+
+
+# Optional non-interactive flags for automation
+EDITION=""; VERSION=""; HN=""; MEM=""; CORES=""; BKT=""; CTID_IN=""; PORT_IN=""
+while [[ ${1:-} == --* ]]; do
+case "$1" in
+--edition) EDITION=${2:?}; shift 2;;
+--version) VERSION=${2:?}; shift 2;;
+--hostname) HN=${2:?}; shift 2;;
+--mem) MEM=${2:?}; shift 2;;
+--cores) CORES=${2:?}; shift 2;;
+--backup-hhmm) BKT=${2:?}; shift 2;;
+--ctid) CTID_IN=${2:?}; shift 2;;
+--port) PORT_IN=${2:?}; shift 2;;
+--) shift; break;;
+*) err "Unknown flag: $1"; exit 1;;
+esac
+done
+
+
+echo "=== Minecraft Server Setup ==="
+
+
+# --- helpers ---
+ctid_exists() { pct config "$1" >/dev/null 2>&1; }
+port_in_use_host() { ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
+seed_port() { [[ ${1:-Java} == Bedrock ]] && echo 19132 || echo 25565; }
+
+
+next_free_ctid_port() {
+local start=$1
+local p=$start
+while :; do
+if ! ctid_exists "$p" && ! port_in_use_host "$p"; then
+echo "$p"; return 0
+fi
+p=$((p+1))
+(( p <= 65535 )) || { err "No free CTID/port found above $start"; return 1; }
+done
+}
+
+
+# Edition
+if [[ -z "$EDITION" ]]; then
+read -r -p "Server Edition [Java]: " EDITION
+EDITION=${EDITION:-Java}
+fi
+if [[ $EDITION != "Java" && $EDITION != "Bedrock" ]]; then
+err "Edition must be 'Java' or 'Bedrock'"; exit 1
 fi
 
 
-# Hostname
-if [[ -z "$HN" ]]; then
-read -r -p "Hostname [mc-$CTID]: " HN
-HN=${HN:-mc-$CTID}
+# Version
+if [[ -z "$VERSION" ]]; then
+read -r -p "Minecraft Version [Latest]: " VERSION
+VERSION=${VERSION:-Latest}
 fi
 
 
@@ -21,6 +67,7 @@ if [[ -z "$MEM" ]]; then
 read -r -p "Memory (MB) [4096]: " MEM
 MEM=${MEM:-4096}
 fi
+[[ "$MEM" =~ ^[0-9]+$ ]] || { err "Memory must be numeric (MB)"; exit 1; }
 
 
 # Cores
@@ -28,14 +75,7 @@ if [[ -z "$CORES" ]]; then
 read -r -p "CPU cores [2]: " CORES
 CORES=${CORES:-2}
 fi
-
-
-# Port
-if [[ -z "$PORT" ]]; then
-PORT_DEFAULT=$(find_free_port 25565)
-read -r -p "Minecraft Port [$PORT_DEFAULT]: " PORT
-PORT=${PORT:-$PORT_DEFAULT}
-fi
+[[ "$CORES" =~ ^[0-9]+$ ]] || { err "Cores must be numeric"; exit 1; }
 
 
 # Backup HHMM
@@ -50,6 +90,30 @@ validate_hhmm "$BKT" || { err "Invalid --backup-hhmm (use HHMM)"; exit 1; }
 fi
 
 
+# --- Auto CTID/Port selection (CTID=Port enforced) ---
+if [[ -n "$CTID_IN" || -n "$PORT_IN" ]]; then
+[[ -z "$CTID_IN" ]] && CTID_IN=$PORT_IN
+[[ -z "$PORT_IN" ]] && PORT_IN=$CTID_IN
+[[ "$CTID_IN" == "$PORT_IN" ]] || { err "CTID and Port must match (CTID=Port policy)."; exit 1; }
+[[ "$CTID_IN" =~ ^[0-9]+$ ]] || { err "CTID/Port must be numeric"; exit 1; }
+(( CTID_IN >= 1 && CTID_IN <= 65535 )) || { err "CTID/Port must be 1-65535"; exit 1; }
+ctid_exists "$CTID_IN" && { err "CTID $CTID_IN already exists"; exit 1; }
+port_in_use_host "$PORT_IN" && { err "Port $PORT_IN is in use on host"; exit 1; }
+CTID=$CTID_IN; PORT=$PORT_IN
+else
+SEED=$(seed_port "$EDITION")
+PICK=$(next_free_ctid_port "$SEED")
+CTID=$PICK; PORT=$PICK
+fi
+
+
+# Hostname (default ties to CTID/Port)
+if [[ -z "$HN" ]]; then
+read -r -p "Hostname [mc-$CTID]: " HN
+HN=${HN:-mc-$CTID}
+fi
+
+
 info "Summary"
 echo "CTID: $CTID"
 echo "Hostname: $HN"
@@ -58,17 +122,9 @@ echo "Version: $VERSION"
 echo "Memory: ${MEM}MB"
 echo "Cores: $CORES"
 echo "Network: Bridge (default)"
-echo "Port: $PORT"
+echo "Port: $PORT (CTID=Port policy)"
 echo "Autostart: Yes (always)"
 echo "Backups: Daily @ ${BKT:0:2}:${BKT:2:2}"
-
-
-if [[ -z "$YES" ]]; then
-read -r -p "Proceed with install [Y/n]: " GO
-GO=${GO:-Y}
-if [[ ! $GO =~ ^[Yy]$ ]]; then exit 0; fi
-fi
-
 
 # --- Create LXC ---
 TEMPLATE=$(ubuntu_template)
