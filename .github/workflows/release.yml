@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'        # push a tag like v1.2.3 to trigger
+  workflow_dispatch:
 
 permissions:
   contents: write    # needed to create a GitHub Release
