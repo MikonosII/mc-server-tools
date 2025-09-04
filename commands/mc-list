@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+printf "%-6s %-14s %-8s %-10s %-8s %-10s %-8s\n" CTID HOSTNAME EDITION VERSION PORT BACKUP STATE
+
+
+while read -r id status rest; do
+[[ $id == "VMID" ]] && continue
+CFG=$(pct config "$id" 2>/dev/null || true)
+[[ -z "$CFG" ]] && continue
+
+
+HN=$(awk -F': ' '/^hostname:/{print $2}' <<<"$CFG")
+MEM=$(awk -F': ' '/^memory:/{print $2}' <<<"$CFG")
+CORES=$(awk -F': ' '/^cores:/{print $2}' <<<"$CFG")
+
+
+# Try to detect edition based on directories
+if pct exec "$id" -- test -d /opt/minecraft 2>/dev/null; then
+ED=Java
+elif pct exec "$id" -- test -d /opt/bedrock 2>/dev/null; then
+ED=Bedrock
+else
+ED=?
+fi
+
+
+# Version and port not tracked explicitly yet
+VR=?
+PO=?
+
+
+# Backup time from cron
+BK=$(awk '{print $2,$1}' /etc/cron.d/mc-server-$id 2>/dev/null | awk '{print $1}' | head -n1)
+if [[ -n "$BK" ]]; then
+BK=$(printf "%04d" "$BK")
+BK="${BK:0:2}:${BK:2:2}"
+else
+BK="--:--"
+fi
+
+
+echo "$rest" | grep -q running && ST=running || ST=stopped
+
+
+printf "%-6s %-14s %-8s %-10s %-8s %-10s %-8s\n" \
+"$id" "${HN:-?}" "$ED" "$VR" "$PO" "$BK" "$ST"
+done < <(pct list)
