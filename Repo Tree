@@ -1,0 +1,41 @@
+mc-server-tools/
+├─ .github/workflows/release.yml
+├─ .gitignore
+├─ Makefile
+├─ README.md
+├─ VERSION
+├─ bin/
+│  └─ mc
+├─ lib/
+│  └─ common.sh
+├─ commands/
+│  ├─ mc-setup
+│  ├─ mc-start
+│  ├─ mc-stop
+│  ├─ mc-restart
+│  ├─ mc-console
+│  ├─ mc-logs
+│  ├─ mc-backup
+│  ├─ mc-delete
+│  ├─ mc-list
+│  └─ mc-clone
+└─ debpkg/
+   ├─ DEBIAN/
+   │  ├─ control
+   │  └─ postinst
+   └─ usr/
+      ├─ bin/
+      │  └─ mc
+      └─ share/mc-server-tools/
+         ├─ lib/common.sh
+         └─ commands/
+            ├─ mc-setup
+            ├─ mc-start
+            ├─ mc-stop
+            ├─ mc-restart
+            ├─ mc-console
+            ├─ mc-logs
+            ├─ mc-backup
+            ├─ mc-delete
+            ├─ mc-list
+            └─ mc-clone
