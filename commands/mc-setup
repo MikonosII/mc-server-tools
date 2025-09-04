@@ -3,6 +3,101 @@ set -euo pipefail
 
 . /usr/share/mc-server-tools/lib/common.sh
 require_root
+# Load networking config (create defaults if missing)
+CONFIG_FILE="/etc/mc-server-tools/config"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  install -d -m 0755 /etc/mc-server-tools
+  cat >"$CONFIG_FILE" <<'EOF'
+BRIDGE="vmbr0"
+NET_JAVA_START="192.168.205.100"
+NET_JAVA_PREFIX="24"
+NET_JAVA_GW="auto"
+NET_BEDROCK_START="192.168.206.100"
+NET_BEDROCK_PREFIX="24"
+NET_BEDROCK_GW="auto"
+EOF
+fi
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+
+# ----- IP math helpers -----
+ip_to_int() { # $1=IPv4
+  awk -v ip="$1" 'BEGIN{split(ip,a,"."); print (a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4]) }'
+}
+int_to_ip() { # $1=int
+  awk -v n="$1" 'BEGIN{a=int(n/16777216);n-=a*16777216;b=int(n/65536);n-=b*65536;c=int(n/256);n-=c*256;d=n; printf("%d.%d.%d.%d",a,b,c,d)}'
+}
+mask_from_prefix() { # $1=prefix -> int mask
+  awk -v p="$1" 'BEGIN{m=(2^32-1)-(2^(32-p)-1); print m}'
+}
+network_of() { # $1=ip $2=prefix -> network ip
+  awk -v ip="$1" -v p="$2" 'BEGIN{
+    split(ip,a,"."); ipi=a[1]*16777216+a[2]*65536+a[3]*256+a[4];
+    m=(2^32-1)-(2^(32-p)-1);
+    n=and(ipi,m);
+    printf("%d.%d.%d.%d", int(n/16777216)%256, int(n/65536)%256, int(n/256)%256, n%256)
+  }'
+}
+first_host() { # $1=ip $2=prefix -> network+1
+  awk -v ip="$1" -v p="$2" 'BEGIN{
+    split(ip,a,"."); ipi=a[1]*16777216+a[2]*65536+a[3]*256+a[4];
+    m=(2^32-1)-(2^(32-p)-1);
+    n=and(ipi,m)+1;
+    printf("%d.%d.%d.%d", int(n/16777216)%256, int(n/65536)%256, int(n/256)%256, n%256)
+  }'
+}
+broadcast_of() { # $1=ip $2=prefix -> broadcast ip
+  awk -v ip="$1" -v p="$2" 'BEGIN{
+    split(ip,a,"."); ipi=a[1]*16777216+a[2]*65536+a[3]*256+a[4];
+    m=(2^32-1)-(2^(32-p)-1);
+    b=or(and(ipi,m),(2^(32-p)-1));
+    printf("%d.%d.%d.%d", int(b/16777216)%256, int(b/65536)%256, int(b/256)%256, b%256)
+  }'
+}
+
+ip_in_same_subnet() { # $1=ip $2=seed $3=prefix
+  local net1 net2; net1=$(network_of "$1" "$3"); net2=$(network_of "$2" "$3")
+  [[ "$net1" == "$net2" ]]
+}
+
+# Extract ip= value from a CT's net0, if present
+ct_ip() {
+  local id=$1
+  pct config "$id" 2>/dev/null | awk -F'[=, ]' '/^net0:/{for(i=1;i<=NF;i++) if($i=="ip"){print $(i+1)}}'
+}
+
+# Is IP already in use by any LXC config we manage?
+ip_used_by_cts() {
+  local ip=$1
+  while read -r id _; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    local nip; nip=$(ct_ip "$id")
+    [[ "$nip" == "$ip"/* ]] && return 0
+  done < <(pct list | awk 'NR>1{print $1}')
+  return 1
+}
+
+# Next free host IP starting from SEED in that subnet (skips network & broadcast)
+next_free_ip() { # $1=seed_ip $2=prefix
+  local seed=$1 pfx=$2
+  local net=$(network_of "$seed" "$pfx")
+  local bcast=$(broadcast_of "$seed" "$pfx")
+  local cur_int=$(( $(ip_to_int "$seed") ))
+  local bcast_int=$(( $(ip_to_int "$bcast") ))
+  # ensure start >= first host
+  local first=$(first_host "$seed" "$pfx")
+  local first_int=$(( $(ip_to_int "$first") ))
+  (( cur_int < first_int )) && cur_int=$first_int
+
+  while (( cur_int < bcast_int )); do
+    local candidate=$(int_to_ip "$cur_int")
+    if ! ip_used_by_cts "$candidate"; then
+      echo "$candidate"; return 0
+    fi
+    ((cur_int++))
+  done
+  return 1
+}
 
 LAST_TEMPLATE_FILE="/var/lib/mc-server-tools/last-template"
 mkdir -p /var/lib/mc-server-tools
@@ -24,6 +119,33 @@ while [[ ${1:-} == --* ]]; do
     *) err "Unknown flag: $1"; exit 1;;
   esac
 done
+
+# ----- Static IPv4 assignment (no DHCP) -----
+if [[ "$EDITION" == "Java" ]]; then
+  IPV4_SEED="${NET_JAVA_START}"
+  IPV4_PFX="${NET_JAVA_PREFIX:-24}"
+  if [[ "${NET_JAVA_GW:-auto}" == "auto" || -z "${NET_JAVA_GW:-}" ]]; then
+    IPV4_GW="$(first_host "$IPV4_SEED" "$IPV4_PFX")"
+    # common case: force .1 if /24 and seed not .1 subnet
+    [[ "$IPV4_PFX" == "24" ]] && IPV4_GW="$(echo "$IPV4_SEED" | awk -F. '{printf "%d.%d.%d.1",$1,$2,$3}')"
+  else
+    IPV4_GW="$NET_JAVA_GW"
+  fi
+else
+  IPV4_SEED="${NET_BEDROCK_START}"
+  IPV4_PFX="${NET_BEDROCK_PREFIX:-24}"
+  if [[ "${NET_BEDROCK_GW:-auto}" == "auto" || -z "${NET_BEDROCK_GW:-}" ]]; then
+    IPV4_GW="$(first_host "$IPV4_SEED" "$IPV4_PFX")"
+    [[ "$IPV4_PFX" == "24" ]] && IPV4_GW="$(echo "$IPV4_SEED" | awk -F. '{printf "%d.%d.%d.1",$1,$2,$3}')"
+  else
+    IPV4_GW="$NET_BEDROCK_GW"
+  fi
+fi
+
+IPV4_ADDR="$(next_free_ip "$IPV4_SEED" "$IPV4_PFX")" || {
+  err "No free IPs available in $(network_of "$IPV4_SEED" "$IPV4_PFX")/$IPV4_PFX"
+}
+
 
 echo "=== Minecraft Server Setup ==="
 
@@ -149,7 +271,7 @@ echo "Edition:   $EDITION"
 echo "Version:   $VERSION"
 echo "Memory:    ${MEM}MB"
 echo "Cores:     $CORES"
-echo "Network:   Bridge (default)"
+echo "IPv4:      ${IPV4_ADDR}/${IPV4_PFX}  gw ${IPV4_GW}  bridge ${BRIDGE}"
 echo "Port:      $PORT (CTID=Port policy)"
 echo "Template:  $TEMPLATE"
 echo "Autostart: Yes (always)"
@@ -165,8 +287,8 @@ pct create "$CTID" "$TEMPLATE" \
   -cores "$CORES" \
   -memory "$MEM" \
   -swap 0 \
-  -net0 "name=eth0,bridge=vmbr0,ip=dhcp" \
-  -rootfs "$STOR:8" \
+  -net0 "name=eth0,bridge=${BRIDGE},ip=${IPV4_ADDR}/${IPV4_PFX},gw=${IPV4_GW}" \
+  -rootfs "$STOR:${DISK_GB}" \
   -unprivileged 1 \
   -onboot 1
 
