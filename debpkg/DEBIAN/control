@@ -1,10 +1,13 @@
 Package: mc-server-tools
-Version: 0.2.0
+Version: @VERSION@
 Section: admin
 Priority: optional
-Architecture: amd64
+Architecture: all
 Maintainer: Your Name <you@example.com>
-Depends: bash, coreutils, grep, sed, awk, lxc-pve | pve-container, pve-manager, curl, screen, util-linux
-Description: Tools to create and manage Minecraft servers on Proxmox LXC
-Bridge networking only, no RCON, autostart always, daily backups via cron.
-Includes mc setup, mc clone (auto-detect Java/Bedrock), and management commands.
+Depends: bash, coreutils, grep, gawk, sed, iproute2, cron, screen, curl, unzip
+Recommends: pve-container, pve-manager
+Suggests: openjdk-21-jre-headless
+Description: Minecraft server tools for Proxmox LXC (Java & Bedrock)
+ Streamlined helper commands to create, copy, manage, and back up Minecraft servers
+ in Proxmox LXC containers. Bridge-only networking, static IPs, thin-provisioned disks,
+ daily backups (vzdump), CTID=Port policy, and auto-detected Java/Bedrock installs.
