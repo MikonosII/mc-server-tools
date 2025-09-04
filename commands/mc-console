@@ -1,5 +1,21 @@
-# replace the attach line with:
-su -s /bin/bash - mcadmin -c "screen -r mc" || {
-  echo "No active screen session named 'mc'. Is the server running?" >&2
-  exit 1
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+CTID=${1:?"Usage: mc console <CTID>"}
+
+
+# Attach to the running screen session inside the CT so you can type server commands
+pct exec "$CTID" -- bash -lc '
+if ! command -v screen >/dev/null 2>&1; then
+echo "screen is not installed inside the container." >&2
+echo "Try: apt-get update && apt-get install -y screen" >&2
+exit 1
+fi
+# Attach to the mc session as the mc user
+su -s /bin/bash - mc -c "screen -r mc" || {
+echo "No active screen session named 'mc'. Is the server running?" >&2
+echo "Start it with: systemctl start minecraft.service (inside CT) or: mc start $CTID (host)" >&2
+exit 1
 }
+'
