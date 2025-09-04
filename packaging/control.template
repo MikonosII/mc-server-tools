@@ -1,0 +1,9 @@
+Package: mc-server-tools
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Your Name <you@example.com>
+Depends: bash (>= 5), curl, jq, unzip, whiptail
+Description: Proxmox LXC Minecraft server toolkit (Java & Bedrock)
+ Automates creation and management of Minecraft servers in Ubuntu LXC on PVE.
