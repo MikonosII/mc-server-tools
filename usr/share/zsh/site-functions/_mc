@@ -1,0 +1,47 @@
+#compdef mc
+
+local -a _subcmds
+_subcmds=('setup:Create a new server CT'
+          'start:Start a server'
+          'stop:Stop a server'
+          'restart:Restart a server'
+          'console:Attach to server console'
+          'logs:Show server logs'
+          'backup:Manual backup'
+          'list:List servers'
+          'copy:Copy worlds to a new CT'
+          'new:Archive old world & create new'
+          'help:Show help')
+
+local state curcontext="$curcontext"
+
+_arguments -C \
+  '1:subcommand:->subcmd' \
+  '*::args:->args'
+
+case $state in
+  subcmd)
+    _describe 'command' _subcmds
+  ;;
+  args)
+    case $words[2] in
+      (start|stop|restart|console|logs|backup|new|copy)
+        # complete CTIDs from pct
+        local -a _ctids
+        _ctids=(${(f)"$(pct list 2>/dev/null | awk 'NR>1{print $1}')"})
+        _wanted ctids expl 'CTID' compadd -a _ctids
+      ;;
+      (setup)
+        _values 'flags' \
+          --edition --version --mem --cores --backup-hhmm --ctid --port --template --disk-gb --storage
+      ;;
+      (copy)
+        _values 'flags' \
+          --storage --disk-gb --mem --cores --backup-hhmm --version --template
+      ;;
+      (new)
+        _values 'flags' --seed
+      ;;
+    esac
+  ;;
+esac
