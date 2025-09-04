@@ -4,6 +4,9 @@ set -euo pipefail
 . /usr/share/mc-server-tools/lib/common.sh
 require_root
 
+LAST_TEMPLATE_FILE="/var/lib/mc-server-tools/last-template"
+mkdir -p /var/lib/mc-server-tools
+
 # Optional non-interactive flags for automation
 EDITION=""; VERSION=""; HN=""; MEM=""; CORES=""; BKT=""; CTID_IN=""; PORT_IN=""; TEMPLATE_IN=""
 while [[ ${1:-} == --* ]]; do
@@ -41,95 +44,33 @@ next_free_ctid_port() {
   done
 }
 
-TEMPLATE_STATE_FILE="/etc/mc-server-tools/last_template"
-mkdir -p /etc/mc-server-tools
+select_template() {
+  local templates
+  templates=$(pveam available --section system | awk '{print $2}')
+  [[ -z "$templates" ]] && { err "No templates found. Use 'pveam download' first."; exit 1; }
 
-# Collect downloaded templates from local and mounted storages
-collect_templates() {
-  local tlist=()
-  # local storage default path
-  if compgen -G "/var/lib/vz/template/cache/*.tar*" > /dev/null; then
-    for f in /var/lib/vz/template/cache/*.tar*; do
-      tlist+=("local:vztmpl/$(basename "$f")")
-    done
-  fi
-  # mounted storages: /mnt/pve/<store>/template/cache
-  for d in /mnt/pve/*/template/cache; do
-    [[ -d "$d" ]] || continue
-    local stor
-    stor=$(basename "$(dirname "$(dirname "$d")")")
-    for f in "$d"/*.tar*; do
-      [[ -e "$f" ]] || continue
-      tlist+=("${stor}:vztmpl/$(basename "$f")")
-    done
-  done
-  printf '%s\n' "${tlist[@]}"
-}
+  local default=""
+  [[ -f "$LAST_TEMPLATE_FILE" ]] && default=$(cat "$LAST_TEMPLATE_FILE")
 
-# Choose default template: last used if present & exists; else prefer Ubuntu 24/22; else first
-choose_template_interactive() {
-  local templates=()
-  mapfile -t templates < <(collect_templates)
-  if [[ ${#templates[@]} -eq 0 ]]; then
-    err "No downloaded LXC templates found. Download one, e.g.:
-  pveam update
-  pveam available | grep ubuntu
-  pveam download local ubuntu-24.04-standard_24.04-1_amd64.tar.zst"; exit 1
-  fi
+  echo "Available templates:"
+  local i=1
+  local arr=()
+  while read -r t; do arr+=("$t"); echo "  $i) $t"; i=$((i+1)); done <<< "$templates"
+  echo
 
-  local default_idx=0
-  local last=;
-  [[ -f "$TEMPLATE_STATE_FILE" ]] && last=$(<"$TEMPLATE_STATE_FILE") || true
-  # find last in list
-  if [[ -n "$last" ]]; then
-    for i in "${!templates[@]}"; do
-      if [[ "${templates[$i]}" == "$last" ]]; then default_idx=$i; break; fi
-    done
+  local choice
+  read -r -p "Choose template [${default:-1}]: " choice
+
+  if [[ -z "$choice" ]]; then
+    if [[ -n "$default" ]]; then TEMPLATE="$default"; else TEMPLATE="${arr[0]}"; fi
+  elif [[ "$choice" =~ ^[0-9]+$ ]]; then
+    TEMPLATE="${arr[$((choice-1))]}"
   else
-    # prefer ubuntu 24/22 if present
-    for i in "${!templates[@]}"; do
-      if [[ "${templates[$i]}" =~ ubuntu-2(4|2)\. ]]; then default_idx=$i; break; fi
-    done
+    TEMPLATE="$choice"
   fi
 
-  echo "Available downloaded templates:"
-  local i
-  for i in "${!templates[@]}"; do
-    printf "  %2d) %s\n" $((i+1)) "${templates[$i]}"
-  done
-
-  local defnum=$((default_idx+1))
-  local sel
-  read -r -p "Template [$defnum]: " sel
-  sel=${sel:-$defnum}
-
-  local pick
-  if [[ "$sel" =~ ^[0-9]+$ ]]; then
-    (( sel >=1 && sel <= ${#templates[@]} )) || { err "Invalid selection"; exit 1; }
-    pick="${templates[$((sel-1))]}"
-  else
-    # allow typing full storage:vztmpl/file
-    pick="$sel"
-  fi
-
-  echo "$pick"
+  echo "$TEMPLATE" > "$LAST_TEMPLATE_FILE"
 }
-
-# Resolve TEMPLATE
-TEMPLATE=""
-if [[ -n "$TEMPLATE_IN" ]]; then
-  TEMPLATE="$TEMPLATE_IN"
-else
-  TEMPLATE=$(choose_template_interactive)
-fi
-
-# Validate template seems plausible (storage:vztmpl/file)
-if [[ ! "$TEMPLATE" =~ ^[^:]+:vztmpl/.+\.tar(\.\w+)?$ ]]; then
-  err "Template must be in the form <storage>:vztmpl/<file.tar.zst>"; exit 1
-fi
-
-# Remember selection
-echo "$TEMPLATE" > "$TEMPLATE_STATE_FILE"
 
 # Edition
 if [[ -z "$EDITION" ]]; then
@@ -193,23 +134,28 @@ if [[ -z "$HN" ]]; then
   HN=${HN:-mc-$CTID}
 fi
 
+# Template selection
+if [[ -z "$TEMPLATE_IN" ]]; then
+  TEMPLATE=$(select_template)
+else
+  TEMPLATE=$TEMPLATE_IN
+  echo "$TEMPLATE" > "$LAST_TEMPLATE_FILE"
+fi
+
 info "Summary"
 echo "CTID:      $CTID"
 echo "Hostname:  $HN"
 echo "Edition:   $EDITION"
 echo "Version:   $VERSION"
-echo "Template:  $TEMPLATE"
 echo "Memory:    ${MEM}MB"
 echo "Cores:     $CORES"
 echo "Network:   Bridge (default)"
 echo "Port:      $PORT (CTID=Port policy)"
+echo "Template:  $TEMPLATE"
 echo "Autostart: Yes (always)"
 echo "Backups:   Daily @ ${BKT:0:2}:${BKT:2:2}"
 
-# --- Create LXC ---
-info "Using template: $TEMPLATE"
-
-# Storage detection for rootfs: pick 'local-lvm' if present else 'local'
+# --- Create LXC using selected template ---
 STOR=$(pvesh get /storage 2>/dev/null | awk '/local-lvm/{print $2}' | head -n1)
 STOR=${STOR:-local}
 
@@ -227,23 +173,30 @@ pct create "$CTID" "$TEMPLATE" \
 info "Starting CT $CTID..."; pct start "$CTID"
 
 if [[ $EDITION == "Java" ]]; then
-  info "Installing Java and server jar..."
-  pct exec "$CTID" -- bash -lc 'apt-get update && apt-get install -y openjdk-21-jre-headless curl screen && \
-    useradd -m -s /bin/bash mc || true && \
-    install -d -o mc -g mc /opt/minecraft && cd /opt/minecraft && \
-    curl -fsSL -o server.jar https://launcher.mojang.com/v1/objects/fe9f03f1f2b44f2d6a6f1a/server.jar || true && \
-    echo "eula=true" > /opt/minecraft/eula.txt && chown -R mc:mc /opt/minecraft'
+  info "Installing Java and server jar (as mcadmin)..."
+  pct exec "$CTID" -- bash -lc '
+    set -e
+    apt-get update
+    apt-get install -y openjdk-21-jre-headless curl screen
+    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
+    install -d -o mcadmin -g mcadmin /opt/minecraft
+    cd /opt/minecraft
+    curl -fsSL -o server.jar https://launcher.mojang.com/v1/objects/fe9f03f1f2b44f2d6a6f1a/server.jar || true
+    echo "eula=true" > /opt/minecraft/eula.txt
+    chown -R mcadmin:mcadmin /opt/minecraft
+  '
 
-  info "Creating start script and service..."
-  pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start <<\"EOS\"
+  info "Creating start script and service (runs as mcadmin)..."
+  pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start << "EOS"
 #!/usr/bin/env bash
 set -e
 cd /opt/minecraft
-su -s /bin/bash - mc -c "screen -dmS mc java -Xms512M -Xmx'"$MEM"'M -jar server.jar nogui"
+# keep session name "mc" for compatibility with tooling
+su -s /bin/bash - mcadmin -c "screen -dmS mc java -Xms512M -Xmx${MEM}M -jar server.jar nogui"
 EOS
 chmod +x /usr/local/bin/mc-start'
 
-  pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service <<EOF
+  pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service << "EOF"
 [Unit]
 Description=Minecraft Server
 After=network.target
@@ -256,18 +209,24 @@ Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
-EOF
-'
+EOF'
 
   pct exec "$CTID" -- systemctl enable minecraft.service
+
 else
-  info "Setting up Bedrock (beta minimal)"
-  pct exec "$CTID" -- bash -lc 'apt-get update && apt-get install -y unzip curl && \
-    useradd -m -s /bin/bash mc || true && \
-    install -d -o mc -g mc /opt/bedrock && cd /opt/bedrock && \
-    curl -fsSL -o bedrock-server.zip https://minecraft.net/en-us/download/server/bedrock && \
-    unzip -o bedrock-server.zip && chown -R mc:mc /opt/bedrock'
-  # TODO: create a systemd service similar to Java
+  info "Setting up Bedrock (as mcadmin; beta minimal)"
+  pct exec "$CTID" -- bash -lc '
+    set -e
+    apt-get update
+    apt-get install -y unzip curl screen
+    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
+    install -d -o mcadmin -g mcadmin /opt/bedrock
+    cd /opt/bedrock
+    curl -fsSL -o bedrock-server.zip https://minecraft.net/en-us/download/server/bedrock
+    unzip -o bedrock-server.zip
+    chown -R mcadmin:mcadmin /opt/bedrock
+  '
+  # TODO: create a systemd service similar to Java that starts Bedrock as mcadmin
 fi
 
 # --- Backups via host cron (vzdump) ---
