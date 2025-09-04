@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+CTID=${1:?"Usage: mc restart <CTID>"}
+
+
+# Restart the Minecraft service inside the CT if it exists
+pct exec "$CTID" -- systemctl restart minecraft.service 2>/dev/null || true
+
+
+# Restart the container itself
+pct restart "$CTID"
+
+
+echo "CT $CTID restarted"
