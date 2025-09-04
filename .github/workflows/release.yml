@@ -1,25 +1,64 @@
-name: release
+name: Release .deb on tag
+
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*'        # push a tag like v1.2.3 to trigger
+
+permissions:
+  contents: write    # needed to create a GitHub Release
 
 jobs:
-  build:
+  build-deb:
     runs-on: ubuntu-latest
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Set VERSION from tag
-        id: v
-        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-      - name: Build tar
-        run: make tar VERSION=${{ steps.v.outputs.version }}
-      - name: Build deb
-        run: make deb VERSION=${{ steps.v.outputs.version }}
-      - name: Release
+      - name: Checkout (with full history for git describe)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential dpkg-dev
+
+      - name: Build .deb with Makefile
+        run: |
+          make deb
+          ls -lh *.deb
+          dpkg-deb -I *.deb || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mc-server-tools-${{ github.ref_name }}
+          path: "*.deb"
+
+      - name: Create GitHub Release and attach .deb (with install notes)
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            mc-server-tools-${{ steps.v.outputs.version }}.tar.gz
-            mc-server-tools-${{ steps.v.outputs.version }}.deb
+          files: "*.deb"
+          name: ${{ github.ref_name }}
           generate_release_notes: true
+          body: |
+            ## Install with wget + apt
+
+            ```bash
+            # Pick the .deb that matches this tag
+            DEB="mc-server-tools_${{ github.ref_name }}_all.deb"
+
+            # Download from this release
+            wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${DEB}"
+
+            # Install (resolves dependencies automatically)
+            sudo apt-get update
+            sudo apt-get install -y "./${DEB}"
+
+            # Quick smoke test
+            mc --help
+            ```
+
+            > Tip: replace `${{ github.ref_name }}` above if you copy/paste into a different tag context.
