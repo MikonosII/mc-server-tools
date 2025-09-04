@@ -13,9 +13,8 @@ echo "Try: apt-get update && apt-get install -y screen" >&2
 exit 1
 fi
 # Attach to the mc session as the mc user
-su -s /bin/bash - mc -c "screen -r mc" || {
-echo "No active screen session named 'mc'. Is the server running?" >&2
-echo "Start it with: systemctl start minecraft.service (inside CT) or: mc start $CTID (host)" >&2
-exit 1
+su -s /bin/bash - mcadmin -c "screen -r mc" || {
+  echo "No active screen session named 'mc'. Is the server running?" >&2
+  exit 1
 }
-'
+
