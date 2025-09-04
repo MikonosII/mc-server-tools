@@ -49,10 +49,10 @@ pct exec "$DST" -- systemctl stop minecraft.service 2>/dev/null || true
 info "Copying world data from $SRC to $DST..."
 if [[ $TYPE == "Java" ]]; then
 pct exec "$SRC" -- bash -lc "cd /opt/minecraft && tar -cf - $(ls -d world* 2>/dev/null || true)" \
-| pct exec "$DST" -- bash -lc "mkdir -p /opt/minecraft && tar -xf - -C /opt/minecraft && chown -R mc:mc /opt/minecraft/world* || true"
+| pct exec "$DST" -- bash -lc "mkdir -p /opt/minecraft && tar -xf - -C /opt/minecraft && chown -R && chown -R mcadmin:mcadmin /opt/minecraft/world* || true"
 else
 pct exec "$SRC" -- bash -lc "cd /opt/bedrock && tar -cf - worlds" \
-| pct exec "$DST" -- bash -lc "mkdir -p /opt/bedrock && tar -xf - -C /opt/bedrock && chown -R mc:mc /opt/bedrock/worlds"
+| pct exec "$DST" -- bash -lc "mkdir -p /opt/bedrock && tar -xf - -C /opt/bedrock && chown -R mcadmin:mcadmin /opt/bedrock/worlds"
 fi
 
 
