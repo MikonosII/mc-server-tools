@@ -1,7 +1,3 @@
-Here’s a complete, polished `README.md` you can drop into the repo. It reflects everything we’ve built: CTID=Port, thin-provisioned disks, static IPs by edition, template picker w/ last-used default, no RCON, bridge-only networking, daily backups (HHMM, default 0400), `mc copy`, and `mc new` with random seed.
-
----
-
 # mc-server-tools
 
 Manage Minecraft servers on **Proxmox LXC**—fast.
