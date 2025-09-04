@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+CTID=${1:?"Usage: mc logs <CTID>"}
+
+
+# Follow the Minecraft service logs inside the CT
+pct exec "$CTID" -- bash -lc '
+if systemctl status minecraft.service >/dev/null 2>&1; then
+journalctl -u minecraft.service -f -n 100
+else
+echo "minecraft.service not found inside container." >&2
+echo "Logs may be available in /opt/minecraft/logs/latest.log instead." >&2
+tail -f /opt/minecraft/logs/latest.log || true
+fi
+'
