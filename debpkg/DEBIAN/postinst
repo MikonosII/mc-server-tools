@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -e
+
+# Ensure correct permissions on installed files
+chmod 0755 /usr/bin/mc || true
+chmod 0755 /usr/share/mc-server-tools/commands/* || true
+
+# Print helpful hint after installation
+cat <<'EON'
+mc-server-tools installed.
+
+Run: mc setup    # to create your first server
+EON
