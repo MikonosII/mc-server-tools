@@ -1,0 +1,16 @@
+# Reference template; the installer writes the active copy into /etc/systemd/system
+[Unit]
+Description=Minecraft Java Server %i
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/minecraft/%i
+User=minecraft
+Group=minecraft
+Restart=on-failure
+RestartSec=10
+ExecStart=/usr/bin/screen -DmS mc-%i /usr/bin/java -Xms1G -Xmx4G -jar server.jar nogui
+ExecStop=/usr/bin/screen -S mc-%i -p 0 -X stuff "stop\r"
+
+[Install]
+WantedBy=multi-user.target
