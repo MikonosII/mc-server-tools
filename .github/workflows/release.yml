@@ -1,0 +1,25 @@
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set VERSION from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+      - name: Build tar
+        run: make tar VERSION=${{ steps.v.outputs.version }}
+      - name: Build deb
+        run: make deb VERSION=${{ steps.v.outputs.version }}
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mc-server-tools-${{ steps.v.outputs.version }}.tar.gz
+            mc-server-tools-${{ steps.v.outputs.version }}.deb
+          generate_release_notes: true
