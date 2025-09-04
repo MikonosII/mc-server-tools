@@ -3,62 +3,116 @@ set -euo pipefail
 . /usr/share/mc-server-tools/lib/common.sh
 require_root
 
+SRC=${1:?'Usage: mc copy <SRC_CTID> [--storage NAME] [--disk-gb N] [--mem MB] [--cores N] [--backup-hhmm HHMM] [--version STR] [--template STORAGE:vztmpl/file]'}
+shift
 
-SRC=${1:?'Usage: mc copy <SRC_CTID>'}
-
+# Optional pass-through flags
+STORAGE_IN=""; DISK_GB_IN=""; MEM_IN=""; CORES_IN=""; BKT_IN=""; VERSION_IN=""; TEMPLATE_IN=""
+while [[ ${1:-} == --* ]]; do
+  case "$1" in
+    --storage)      STORAGE_IN=${2:?}; shift 2;;
+    --disk-gb)      DISK_GB_IN=${2:?}; shift 2;;
+    --mem)          MEM_IN=${2:?}; shift 2;;
+    --cores)        CORES_IN=${2:?}; shift 2;;
+    --backup-hhmm)  BKT_IN=${2:?}; shift 2;;
+    --version)      VERSION_IN=${2:?}; shift 2;;
+    --template)     TEMPLATE_IN=${2:?}; shift 2;;
+    --) shift; break;;
+    *) err "Unknown flag: $1"; exit 1;;
+  esac
+done
 
 pct config "$SRC" >/dev/null || { err "Source CT $SRC not found"; exit 1; }
 
+# --- helpers (local copies to avoid depending on mc-setup internals) ---
+ctid_exists() { pct config "$1" >/dev/null 2>&1; }
+port_in_use_host() { ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
+seed_port() { [[ $1 == Bedrock ]] && echo 19132 || echo 25565; }
+next_free_ctid_port() {
+  local start=$1 p=$start
+  while :; do
+    if ! ctid_exists "$p" && ! port_in_use_host "$p"; then echo "$p"; return 0; fi
+    p=$((p+1)); (( p <= 65535 )) || { err "No free CTID/port >= $start"; return 1; }
+  done
+}
 
-# Detect edition in source
-if pct exec "$SRC" -- test -d /opt/minecraft; then
-TYPE="Java"; SEED=25565; SRC_WORLD_ROOT="/opt/minecraft"
-elif pct exec "$SRC" -- test -d /opt/bedrock/worlds; then
-TYPE="Bedrock"; SEED=19132; SRC_WORLD_ROOT="/opt/bedrock"
+# Pick a non-interactive template (last used > ubuntu24/22 > first found)
+TEMPLATE_STATE_FILE="/etc/mc-server-tools/last_template"
+collect_templates() {
+  local tlist=()
+  if compgen -G "/var/lib/vz/template/cache/*.tar*" >/dev/null; then
+    for f in /var/lib/vz/template/cache/*.tar*; do tlist+=("local:vztmpl/$(basename "$f")"); done
+  fi
+  for d in /mnt/pve/*/template/cache; do
+    [[ -d "$d" ]] || continue
+    local stor; stor=$(basename "$(dirname "$(dirname "$d")")")
+    for f in "$d"/*.tar*; do [[ -e "$f" ]] && tlist+=("${stor}:vztmpl/$(basename "$f")"); done
+  done
+  printf '%s\n' "${tlist[@]}"
+}
+default_template() {
+  local templates=(); mapfile -t templates < <(collect_templates)
+  [[ ${#templates[@]} -gt 0 ]] || { err "No downloaded LXC templates found. Download one with pveam."; }
+  if [[ -f "$TEMPLATE_STATE_FILE" ]]; then
+    local last; last=$(<"$TEMPLATE_STATE_FILE")
+    for t in "${templates[@]}"; do [[ "$t" == "$last" ]] && { echo "$t"; return; }; done
+  fi
+  for t in "${templates[@]}"; do [[ "$t" =~ ubuntu-24\.|ubuntu-22\. ]] && { echo "$t"; return; }; done
+  echo "${templates[0]}"
+}
+
+# --- Detect edition in source ---
+if pct exec "$SRC" -- test -d /opt/minecraft 2>/dev/null; then
+  TYPE="Java"; SRC_WORLD_ROOT="/opt/minecraft"
+elif pct exec "$SRC" -- test -d /opt/bedrock/worlds 2>/dev/null; then
+  TYPE="Bedrock"; SRC_WORLD_ROOT="/opt/bedrock"
 else
-err "Could not detect world directory in CT $SRC"; exit 1
+  err "Could not detect world directory in CT $SRC (expect /opt/minecraft or /opt/bedrock/worlds)"; exit 1
 fi
 
-
-# Mirror resources
+# Mirror resources from source (fallbacks)
 SRC_MEM=$(pct config "$SRC" | awk -F': ' '/^memory:/{print $2}')
 SRC_CORES=$(pct config "$SRC" | awk -F': ' '/^cores:/{print $2}')
 SRC_MEM=${SRC_MEM:-4096}
 SRC_CORES=${SRC_CORES:-2}
 
+# Destination CTID=Port (auto)
+DST=$(next_free_ctid_port "$(seed_port "$TYPE")")
 
-# Pick next free CTID=Port for copy
-DST=$(next_free_ctid_port "$SEED")
-
-
-info "Creating destination CT $DST via mc setup (edition: $TYPE)..."
-/usr/bin/mc setup \
---edition "$TYPE" \
---version Latest \
---ctid "$DST" \
---hostname "mc-$DST" \
---mem "$SRC_MEM" \
---cores "$SRC_CORES" \
---backup-hhmm 0400
-
-
-# Stop service before copy
-pct exec "$DST" -- systemctl stop minecraft.service 2>/dev/null || true
-
-
-info "Copying world data from $SRC to $DST..."
-if [[ $TYPE == "Java" ]]; then
-pct exec "$SRC" -- bash -lc "cd /opt/minecraft && tar -cf - $(ls -d world* 2>/dev/null || true)" \
-| pct exec "$DST" -- bash -lc "mkdir -p /opt/minecraft && tar -xf - -C /opt/minecraft && chown -R && chown -R mcadmin:mcadmin /opt/minecraft/world* || true"
-else
-pct exec "$SRC" -- bash -lc "cd /opt/bedrock && tar -cf - worlds" \
-| pct exec "$DST" -- bash -lc "mkdir -p /opt/bedrock && tar -xf - -C /opt/bedrock && chown -R mcadmin:mcadmin /opt/bedrock/worlds"
+# Non-interactive template selection (unless user supplied one)
+if [[ -z "$TEMPLATE_IN" ]]; then
+  TEMPLATE_IN=$(default_template)
 fi
 
+# Ensure a backup time is supplied to avoid prompting
+BKT_IN=${BKT_IN:-0400}
 
-# Restart service
+info "Creating destination CT $DST via mc setup (edition: $TYPE, thin-provisioned)..."
+/usr/bin/mc setup \
+  --edition "$TYPE" \
+  --version "${VERSION_IN:-Latest}" \
+  --ctid "$DST" \
+  --mem "${MEM_IN:-$SRC_MEM}" \
+  --cores "${CORES_IN:-$SRC_CORES}" \
+  --backup-hhmm "$BKT_IN" \
+  --template "$TEMPLATE_IN" \
+  ${STORAGE_IN:+--storage "$STORAGE_IN"} \
+  ${DISK_GB_IN:+--disk-gb "$DISK_GB_IN"}
+
+# Stop destination service to safely copy world data
+pct exec "$DST" -- systemctl stop minecraft.service 2>/dev/null || true
+
+info "Copying world data from $SRC to $DST (owner: mcadmin)..."
+if [[ $TYPE == "Java" ]]; then
+  pct exec "$SRC" -- bash -lc "cd /opt/minecraft && tar -cf - \$(ls -d world* 2>/dev/null || true)" \
+  | pct exec "$DST" -- bash -lc "mkdir -p /opt/minecraft && tar -xf - -C /opt/minecraft && chown -R mcadmin:mcadmin /opt/minecraft/world* || true"
+else
+  pct exec "$SRC" -- bash -lc "cd /opt/bedrock && tar -cf - worlds" \
+  | pct exec "$DST" -- bash -lc "mkdir -p /opt/bedrock && tar -xf - -C /opt/bedrock && chown -R mcadmin:mcadmin /opt/bedrock/worlds"
+fi
+
+# Start destination server
 pct exec "$DST" -- systemctl start minecraft.service 2>/dev/null || true
-
 
 info "Copy complete. New CTID=Port: $DST (Edition: $TYPE)"
 info "Use: mc start $DST | mc console $DST | mc logs $DST"
