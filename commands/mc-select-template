@@ -1,236 +1,210 @@
 #!/usr/bin/env bash
-# mc-select-template — interactive template picker for mc-setup
-# Prints exactly one value on stdout:  storage:vztmpl/<file>
-# Behavior:
-#   - If --template matches an installed template (fully-qualified), prints it.
-#   - If --template is a bare filename and uniquely matches, prints that match.
-#   - Otherwise, lists installed templates and prompts the user.
-#   - If none installed, offers to download via pveam, then prints the result.
+# mc-select-template — pick or download a Debian/Ubuntu "standard" LXC template
+# Prints the selected template path (e.g., local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst) to stdout.
+# Non-interactive: accepts $MC_TEMPLATE or first CLI arg as a preselection; validates it exists or offers to download.
 
-# Always run under bash
-if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 set -euo pipefail
 
-TEMPLATE_IN=""
-DEFAULT_TEMPLATE=""
+# ---- config (can be overridden with env) ----
+: "${MC_TEMPLATE_FILTER:=^(debian|ubuntu).*-standard_.*\.(tar\.(zst|xz)|tgz)$}"
+: "${MC_DOWNLOAD_OS:=debian}"     # default when auto-downloading if none found (debian|ubuntu)
+: "${MC_STORAGE_DEFAULT:=local}"  # default storage for downloads
+: "${MC_NONINTERACTIVE:=0}"       # set to 1 to avoid prompts; will auto-download if needed
 
-# --- arg parse ---
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --template) TEMPLATE_IN="${2:-}"; shift 2 ;;
-    --default)  DEFAULT_TEMPLATE="${2:-}"; shift 2 ;;
-    --) shift; break ;;
-    *) break ;;
-  esac
-done
+# ---- helpers ----
+err(){ echo "[mc-select-template] ERROR: $*" >&2; }
+warn(){ echo "[mc-select-template] WARN:  $*" >&2; }
+info(){ echo "[mc-select-template] $*"; }
 
-# --- helpers ---
-is_installed() {
-  # $1 = storage:vztmpl/file
-  local sel="$1" storage file cache
-  case "$sel" in
-    *:vztmpl/*)
-      storage="${sel%%:vztmpl/*}"
-      file="${sel##*:vztmpl/}"
-      if [ "$storage" = "local" ]; then
-        cache="/var/lib/vz/template/cache"
-      else
-        cache="/mnt/pve/$storage/template/cache"
-      fi
-      [ -f "$cache/$file" ]
-      ;;
-    *) return 1 ;;
-  esac
+require_cmd(){ command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; exit 1; }; }
+
+# ---- preflight ----
+require_cmd pveam
+require_cmd pvesm
+require_cmd awk
+require_cmd sed
+require_cmd grep
+
+# ---- read arg/preselection ----
+PRESEL="${1:-${MC_TEMPLATE:-}}"
+
+# Returns list of cached templates on all storages (format: storage:vztmpl/filename)
+list_cached() {
+  # pveam list <storage> shows cached items; enumerate storages that have vzdump/vztmpl volume types
+  # We’ll query all storages and collect their cached templates.
+  local s
+  while read -r s; do
+    pveam list "$s" 2>/dev/null || true
+  done < <(pvesm status --verbose 2>/dev/null | awk 'NR>1 && $2 ~ /yes|active|available|enabled/ {print $1}')
 }
 
-list_installed() {
-  # emits "storage:vztmpl/file" per line
-  local s path
-  # list storages known to Proxmox
-  pvesm status 2>/dev/null | awk 'NR>1{print $1}' | while read -r s; do
-    if [ "$s" = "local" ]; then
-      path="/var/lib/vz/template/cache"
-    else
-      path="/mnt/pve/$s/template/cache"
-    fi
-    if [ -d "$path" ]; then
-      find "$path" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | while read -r f; do
-        printf '%s:vztmpl/%s\n' "$s" "$f"
-      done
-    fi
-  done
+# Filter to debian/ubuntu *standard* templates
+filter_standard() {
+  grep -Eo '^[[:alnum:]_:-]+:vztmpl/[[:graph:]]+' | awk '{print $1}' | awk -v RS='\r\n' '1' | grep -E "$MC_TEMPLATE_FILTER" || true
 }
 
-pick_storage() {
-  # prints chosen storage name
-  local S_LIST def_idx pick storage
-  S_LIST="$(mktemp)"; trap 'rm -f "$S_LIST"' RETURN
-  pvesm status 2>/dev/null | awk 'NR>1{print $1}' >"$S_LIST"
-  if ! [ -s "$S_LIST" ]; then
-    echo "No storages found via pvesm status." >&2
-    return 1
-  fi
-  def_idx="$(nl -w1 -s: "$S_LIST" | awk -F: '$2=="local"{print $1; f=1; exit} END{if(!f) print 1}')"
-  echo "Storages:" >&2
-  nl -w1 -s'. ' "$S_LIST" >&2
-  echo >&2
-  read -r -p "Choose storage for download [${def_idx}]: " pick
-  if [ -z "$pick" ]; then
-    storage="$(sed -n "${def_idx}p" "$S_LIST")"
-  elif printf '%s\n' "$pick" | grep -Eq '^[0-9]+$'; then
-    storage="$(sed -n "${pick}p" "$S_LIST")"
-  else
-    storage="$pick"
-  fi
-  [ -n "$storage" ] || { echo "No storage selected." >&2; return 1; }
-  printf '%s\n' "$storage"
+# Echo first available "standard" template name from remote catalog for a given OS
+pick_remote_latest() {
+  local os="${1:-debian}"
+  # pveam available prints remote catalog; we take the last (usually latest) matching -standard for the OS
+  pveam available 2>/dev/null | awk -v os="$os" '
+    tolower($0) ~ os && tolower($0) ~ /standard/ {print $2}
+  ' | sort -V | tail -n1
 }
 
+# Download template into storage
 download_template() {
-  # offers a catalog & downloads; prints "storage:vztmpl/file" on success
-  local storage name C_LIST t
-  storage="$(pick_storage)" || return 1
-
-  C_LIST="$(mktemp)"; trap 'rm -f "$C_LIST"' RETURN
-  # Try section-filtered, fall back to unfiltered for older PVE
-  if ! pveam available --section system 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' >"$C_LIST"; then
-    pveam available 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' >"$C_LIST" || true
-  fi
-  if ! [ -s "$C_LIST" ]; then
-    echo "No catalog entries returned by pveam." >&2
-    return 1
-  fi
-
-  echo "Available templates (first 20 shown):" >&2
-  head -n 20 "$C_LIST" | nl -w1 -s'. ' >&2
-  echo >&2
-  read -r -p "Download which? (number or full name) [1]: " t
-  if [ -z "$t" ]; then
-    name="$(sed -n '1p' "$C_LIST")"
-  elif printf '%s\n' "$t" | grep -Eq '^[0-9]+$'; then
-    name="$(sed -n "${t}p" "$C_LIST")"
-  else
-    name="$t"
-  fi
-  [ -n "$name" ] || { echo "No template selected." >&2; return 1; }
-
-  echo "-- Downloading $name to $storage..." >&2
-  pveam download "$storage" "$name"
-  printf '%s:vztmpl/%s\n' "$storage" "$name"
+  local storage="$1" tmpl="$2"
+  info "Downloading ${tmpl} into storage ${storage} (this may take a while)…"
+  pveam update || true
+  pveam download "$storage" "$tmpl"
 }
 
-# --- main logic ---
+# ---- If a template was preselected, validate or attempt download ----
+if [[ -n "$PRESEL" ]]; then
+  if [[ "$PRESEL" =~ :vztmpl/ ]]; then
+    # Looks like a full storage:path reference — check it exists in cache
+    if list_cached | grep -Fxq "$PRESEL"; then
+      echo "$PRESEL"
+      exit 0
+    fi
+    # If not cached, try to split into storage + filename and download it
+    storage="${PRESEL%%:*}"
+    file="${PRESEL#*:vztmpl/}"
+    if [[ -n "$storage" && -n "$file" ]]; then
+      download_template "$storage" "$file"
+      echo "$PRESEL"
+      exit 0
+    fi
+    err "Preselected template '$PRESEL' not found and could not infer download parts."
+    exit 1
+  else
+    # Looks like just a filename; try to find it in any storage
+    if found=$(list_cached | grep -E ":vztmpl/${PRESEL}$" | head -n1); then
+      if [[ -n "$found" ]]; then
+        echo "$found"
+        exit 0
+      fi
+    fi
+    # Try download into default storage
+    download_template "$MC_STORAGE_DEFAULT" "$PRESEL"
+    echo "${MC_STORAGE_DEFAULT}:vztmpl/${PRESEL}"
+    exit 0
+  fi
+fi
 
-# Build installed list
-T_LIST="$(mktemp)"; trap 'rm -f "$T_LIST"' EXIT
-list_installed >"$T_LIST"
-count="$(wc -l < "$T_LIST" | tr -d '[:space:]')"
+# ---- Interactive or non-interactive selection from cached list ----
+mapfile -t CACHED < <(list_cached | filter_standard | sort -V | uniq)
 
-# 1) Fully-qualified input that is already installed
-if [ -n "$TEMPLATE_IN" ] && is_installed "$TEMPLATE_IN"; then
-  printf '%s\n' "$TEMPLATE_IN"
+if [[ ${#CACHED[@]} -eq 0 ]]; then
+  warn "No cached Debian/Ubuntu *standard* templates found."
+
+  # If non-interactive, auto-pick latest from remote catalog and download
+  if [[ "$MC_NONINTERACTIVE" == "1" ]]; then
+    os="${MC_DOWNLOAD_OS}"
+    tmpl="$(pick_remote_latest "$os")"
+    [[ -n "$tmpl" ]] || { err "No remote $os standard template found in catalog."; exit 1; }
+    download_template "$MC_STORAGE_DEFAULT" "$tmpl"
+    echo "${MC_STORAGE_DEFAULT}:vztmpl/${tmpl}"
+    exit 0
+  fi
+
+  # Interactive flow: offer update + download
+  echo
+  read -rp "Update template catalog now? [Y/n] " yn
+  yn=${yn:-Y}
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    pveam update || true
+  fi
+
+  echo
+  echo "Select OS to download:"
+  select os in "debian" "ubuntu" "quit"; do
+    case "$os" in
+      debian|ubuntu) break ;;
+      quit) exit 1 ;;
+      *) echo "Invalid choice." ;;
+    esac
+  done
+
+  tmpl="$(pick_remote_latest "$os")"
+  if [[ -z "$tmpl" ]]; then
+    err "Could not find a '$os' *standard* template in the remote catalog."
+    exit 1
+  fi
+
+  echo
+  echo "Available storages:"
+  mapfile -t STOR < <(pvesm status --verbose | awk 'NR>1 {print $1}')
+  for i in "${!STOR[@]}"; do printf " [%d] %s\n" "$i" "${STOR[$i]}"; done
+  read -rp "Choose storage for download [default: ${MC_STORAGE_DEFAULT}]: " sidx
+  if [[ -n "${sidx:-}" && "$sidx" =~ ^[0-9]+$ && $sidx -ge 0 && $sidx -lt ${#STOR[@]} ]]; then
+    storage="${STOR[$sidx]}"
+  else
+    storage="$MC_STORAGE_DEFAULT"
+  fi
+
+  download_template "$storage" "$tmpl"
+  echo "${storage}:vztmpl/${tmpl}"
   exit 0
 fi
 
-# 2) Bare filename unique match among installed
-if [ -n "$TEMPLATE_IN" ] && printf '%s' "$TEMPLATE_IN" | grep -vq ':vztmpl/'; then
-  matches=0 last=""
-  while IFS= read -r line; do
-    fn="${line##*:vztmpl/}"
-    if [ "$fn" = "$TEMPLATE_IN" ]; then
-      matches=$((matches+1)); last="$line"
-    fi
-  done < "$T_LIST"
-  if [ "$matches" -eq 1 ]; then
-    printf '%s\n' "$last"
-    exit 0
-  fi
-fi
-
-# 3) No installed templates => offer download
-if [ "$count" -eq 0 ]; then
-  echo "No installed templates found." >&2
-  read -r -p "Download a template now? [Y/n]: " ans; ans="${ans:-Y}"
-  case "$ans" in
-    Y|y) download_template; exit 0 ;;
-    *)   echo "Aborting: no templates installed." >&2; exit 1 ;;
-  esac
-fi
-
-# 4) Menu of installed templates
-echo "Installed templates:" >&2
-nl -w1 -s'. ' "$T_LIST" >&2
-echo >&2
-
-# Determine default index if DEFAULT_TEMPLATE matches an installed line
-def_idx=""
-idx=1
-while IFS= read -r line; do
-  if [ -n "$DEFAULT_TEMPLATE" ] && [ "$line" = "$DEFAULT_TEMPLATE" ]; then
-    def_idx="$idx"
-    break
-  fi
-  idx=$((idx+1))
-done < "$T_LIST"
-
-if [ -n "$def_idx" ]; then
-  prompt="Choose template [${def_idx}] or 'd' to download: "
-else
-  prompt="Choose template (number) or 'd' to download: "
-fi
-
-while :; do
-  read -r -p "$prompt" choice
-  if [ -z "$choice" ]; then
-    if [ -n "$def_idx" ]; then
-      sel="$(sed -n "${def_idx}p" "$T_LIST")"
-      printf '%s\n' "$sel"
-      exit 0
-    fi
-    echo "Please enter a number or 'd' to download." >&2
-    continue
-  fi
-
-  if printf '%s\n' "$choice" | grep -Eq '^[0-9]+$'; then
-    sel="$(sed -n "${choice}p" "$T_LIST")"
-    if [ -n "$sel" ]; then
-      printf '%s\n' "$sel"
-      exit 0
-    fi
-    echo "Invalid number." >&2
-    continue
-  fi
-
-  if printf '%s\n' "$choice" | grep -Eq '^[dD]$'; then
-    download_template
-    exit 0
-  fi
-
-  # allow typing a full "storage:vztmpl/file"
-  if printf '%s' "$choice" | grep -q ':vztmpl/'; then
-    if is_installed "$choice"; then
-      printf '%s\n' "$choice"
-      exit 0
-    fi
-    echo "Template '$choice' not installed." >&2
-    continue
-  fi
-
-  # allow typing a bare filename if unique
-  matches=0 last=""
-  while IFS= read -r line; do
-    fn="${line##*:vztmpl/}"
-    if [ "$fn" = "$choice" ]; then
-      matches=$((matches+1)); last="$line"
-    fi
-  done < "$T_LIST"
-
-  if [ "$matches" -eq 1 ]; then
-    printf '%s\n' "$last"
-    exit 0
-  elif [ "$matches" -gt 1 ]; then
-    echo "Filename '$choice' is ambiguous; pick a number." >&2
-  else
-    echo "Filename '$choice' not found; pick a number or 'd' to download." >&2
-  fi
+# We have cached templates — present a menu
+echo "Cached Debian/Ubuntu *standard* templates:"
+for i in "${!CACHED[@]}"; do
+  printf " [%d] %s\n" "$i" "${CACHED[$i]}"
 done
+echo " [d] Download a new template"
+echo " [q] Quit"
+
+# Non-interactive? pick the latest cached and return
+if [[ "$MC_NONINTERACTIVE" == "1" ]]; then
+  echo "${CACHED[-1]}"
+  exit 0
+fi
+
+read -rp "Choose template index, or 'd' to download: " choice
+
+case "$choice" in
+  q|Q) exit 1 ;;
+  d|D)
+    # jump to the “no cached” branch behavior: update + choose OS + choose storage + download
+    pveam update || true
+    echo
+    echo "Select OS to download:"
+    select os in "debian" "ubuntu" "quit"; do
+      case "$os" in
+        debian|ubuntu) break ;;
+        quit) exit 1 ;;
+        *) echo "Invalid choice." ;;
+      esac
+    done
+    tmpl="$(pick_remote_latest "$os")"
+    [[ -n "$tmpl" ]] || { err "No remote $os standard template found."; exit 1; }
+    echo
+    echo "Available storages:"
+    mapfile -t STOR < <(pvesm status --verbose | awk 'NR>1 {print $1}')
+    for i in "${!STOR[@]}"; do printf " [%d] %s\n" "$i" "${STOR[$i]}"; done
+    read -rp "Choose storage for download [default: ${MC_STORAGE_DEFAULT}]: " sidx
+    if [[ -n "${sidx:-}" && "$sidx" =~ ^[0-9]+$ && $sidx -ge 0 && $sidx -lt ${#STOR[@]} ]]; then
+      storage="${STOR[$sidx]}"
+    else
+      storage="$MC_STORAGE_DEFAULT"
+    fi
+    download_template "$storage" "$tmpl"
+    echo "${storage}:vztmpl/${tmpl}"
+    ;;
+  ''|*[!0-9]*)
+    err "Invalid choice: $choice"
+    exit 1
+    ;;
+  *)
+    idx="$choice"
+    if [[ "$idx" -ge 0 && "$idx" -lt ${#CACHED[@]} ]]; then
+      echo "${CACHED[$idx]}"
+    else
+      err "Index out of range."
+      exit 1
+    fi
+    ;;
+esac
