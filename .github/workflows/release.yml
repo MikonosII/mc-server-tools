@@ -15,34 +15,16 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # needed for git describe versioning
+      - uses: actions/checkout@v4
 
       - name: Build .deb
-        run: |
-          set -euo pipefail
-          make clean deb
-          ls -l build/*.deb
-
-      # Find the built .deb and expose path/filename as outputs
-      - name: Locate deb artifact
         id: deb
-        shell: bash
         run: |
-          set -euo pipefail
-          FILE="$(ls -1 build/*.deb | head -n1)"
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          make clean
+          make deb
+          FILE=$(ls build/*.deb | head -n1)
+          echo "file=${FILE}" >> "$GITHUB_OUTPUT"
           echo "url_file=$(basename "$FILE")" >> "$GITHUB_OUTPUT"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.deb.outputs.url_file }}
-          path: ${{ steps.deb.outputs.file }}
-          if-no-files-found: error
-          retention-days: 14
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -53,9 +35,11 @@ jobs:
           body: |
             ## Install with wget + apt
             ```bash
-            wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.deb.outputs.url_file }}"
+            TAG="${{ github.ref_name }}"
+            REPO="${{ github.repository }}"
+            ASSET="${{ steps.deb.outputs.url_file }}"
+            wget -q "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
             apt-get update
-            apt-get install -y "./${{ steps.deb.outputs.file }}"
-            # Quick smoke test
+            apt-get install -y "./${ASSET}"
             mc --help
             ```
