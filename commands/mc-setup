@@ -12,6 +12,7 @@ set -euo pipefail
 
 # --- Common / config ---
 . /usr/share/mc-server-tools/lib/common.sh
+. /usr/share/mc-server-tools/lib/preflight.sh
 require_root
 
 CONFIG_FILE="/etc/mc-server-tools/config"
@@ -225,10 +226,9 @@ if [[ -z "$HN" ]]; then
   HN=${HN:-$DEFAULT_HN}
 fi
 
-# right before you call mc-select-template
+# Ensure template helper exists
 [[ -x /usr/share/mc-server-tools/commands/mc-select-template ]] \
   || { err "mc-select-template helper not found (expected at /usr/share/mc-server-tools/commands/mc-select-template)"; exit 1; }
-
 
 # --- Template selection via helper (no default unless saved & valid) ---
 TEMPLATE="$(
@@ -258,6 +258,9 @@ echo "Disk:      ${DISK_GB}G on $STOR"
 echo "Autostart: Yes (always)"
 echo "Backups:   Daily @ ${BKT:0:2}:${BKT:2:2}"
 
+# --- Prompt for mcadmin password (double prompt) ---
+prompt_password_confirm MCPASS "password for mcadmin"
+
 info "Creating container CT $CTID..."
 pct create "$CTID" "$TEMPLATE" \
   -hostname "$HN" \
@@ -285,14 +288,21 @@ else
   info "Gateway $IPV4_GW is reachable from inside CT $CTID"
 fi
 
+# --- Run preflight hardening and create mcadmin with provided password ---
+info "[mc-setup] Running preflight networking/apt hardening…"
+preflight_net_apt "$CTID"
+
+info "[mc-setup] Creating mcadmin with provided password…"
+preflight_create_mcadmin "$CTID" "$MCPASS"
+unset MCPASS
+
+# --- Edition-specific install ---
 if [[ $EDITION == "Java" ]]; then
-  info "Installing Java (official Mojang vanilla) and server jar (as mcadmin)..."
+  info "Installing Java (official Mojang vanilla) and server jar (as mcadmin)…"
   pct exec "$CTID" -- env MC_VER="$VERSION" bash -lc '
   set -euo pipefail
   apt-get update
   apt-get install -y openjdk-21-jre-headless curl jq screen
-  id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
-  echo "mcadmin:changeme" | chpasswd
   install -d -o mcadmin -g mcadmin /opt/minecraft
   cd /opt/minecraft
 
@@ -301,20 +311,20 @@ if [[ $EDITION == "Java" ]]; then
 
   # Resolve "Latest" -> latest release id
   if [[ "$VER" =~ ^[Ll]atest$ ]]; then
-    VER="$(printf "%s" "$MANIFEST_JSON" | jq -r '"'"'.latest.release'"'"')"
+    VER="$(printf "%s" "$MANIFEST_JSON" | jq -r ".latest.release")"
   fi
 
-  # Find the per-version manifest URL (single quotes keep $v for jq, not the shell)
+  # Find the per-version manifest URL
   MANIFEST_URL="$(printf "%s" "$MANIFEST_JSON" \
-    | jq -r --arg v "$VER" '"'"'.versions[] | select(.id==$v) | .url'"'"' \
+    | jq -r --arg v "$VER" ".versions[] | select(.id==$v) | .url" \
     | head -n1)"
 
-  # If not found, fall back to latest release cleanly
+  # If not found, fall back to latest release
   if [[ -z "${MANIFEST_URL:-}" || "$MANIFEST_URL" == "null" ]]; then
     echo "Requested version $VER not found; falling back to latest release" >&2
-    VER="$(printf "%s" "$MANIFEST_JSON" | jq -r '"'"'.latest.release'"'"')"
+    VER="$(printf "%s" "$MANIFEST_JSON" | jq -r ".latest.release")"
     MANIFEST_URL="$(printf "%s" "$MANIFEST_JSON" \
-      | jq -r --arg v "$VER" '"'"'.versions[] | select(.id==$v) | .url'"'"' \
+      | jq -r --arg v "$VER" ".versions[] | select(.id==$v) | .url" \
       | head -n1)"
   fi
 
@@ -323,7 +333,7 @@ if [[ $EDITION == "Java" ]]; then
     exit 1
   fi
 
-  JAR_URL="$(curl -fsSL "$MANIFEST_URL" | jq -r '"'"'.downloads.server.url'"'"')"
+  JAR_URL="$(curl -fsSL "$MANIFEST_URL" | jq -r ".downloads.server.url")"
   if [[ -z "${JAR_URL:-}" || "$JAR_URL" == "null" ]]; then
     echo "Could not find server.jar URL in per-version manifest. Aborting." >&2
     exit 1
@@ -334,8 +344,7 @@ if [[ $EDITION == "Java" ]]; then
   chown -R mcadmin:mcadmin /opt/minecraft
 '
 
-  info "Creating start script and service (runs as mcadmin)..."
-  # Bake MEM into the script at creation time
+  info "Creating start script and service (runs as mcadmin)…"
   pct exec "$CTID" -- env MEM="$MEM" bash -lc 'cat >/usr/local/bin/mc-start << EOF
 #!/usr/bin/env bash
 set -e
@@ -371,8 +380,6 @@ else
     set -e
     apt-get update
     apt-get install -y unzip curl screen
-    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
-    echo "mcadmin:changeme" | chpasswd
     install -d -o mcadmin -g mcadmin /opt/bedrock
     cd /opt/bedrock
     BEDROCK_URL=$(curl -fsSL https://www.minecraft.net/en-us/download/server/bedrock | grep -oE "https://minecraft\.azureedge\.net/bin-linux/bedrock-server-[0-9\.]+\.zip" | head -n1)
@@ -382,7 +389,7 @@ else
     chown -R mcadmin:mcadmin /opt/bedrock
   '
 
-  info "Creating start script and service (runs as mcadmin)..."
+  info "Creating start script and service (runs as mcadmin)…"
   pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start << "EOS"
 #!/usr/bin/env bash
 set -e
