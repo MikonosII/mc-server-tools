@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Make sure our libs are present
+. /usr/share/mc-server-tools/lib/common.sh
+. /usr/share/mc-server-tools/lib/preflight.sh
+
+CTID="${1:-}"
+if [[ -z "$CTID" ]]; then
+  echo "Usage: mc-preflight <CTID>" >&2
+  exit 2
+fi
+
+preflight_net_apt "$CTID"
+
+# Optionally prompt for mcadmin password here as a convenience
+if ask_yes_no "Create/ensure mcadmin user now?" "y"; then
+  prompt_password_confirm MCPASS "password for mcadmin"
+  preflight_create_mcadmin "$CTID" "$MCPASS"
+  unset MCPASS
+fi
+
+echo "[mc-preflight] Done."
