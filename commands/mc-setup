@@ -131,6 +131,9 @@ IPV4_ADDR="$(next_free_ip "$IPV4_SEED" "$IPV4_PFX")" || {
   err "No free IPs available in $(network_of "$IPV4_SEED" "$IPV4_PFX")/$IPV4_PFX"; exit 1;
 }
 
+echo "Selected IPv4 address: ${IPV4_ADDR}/${IPV4_PFX}"
+echo "Gateway: ${IPV4_GW}"
+
 echo "=== Minecraft Server Setup ==="
 
 # ----- Simple helpers -----
