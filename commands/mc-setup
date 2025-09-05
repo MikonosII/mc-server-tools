@@ -288,28 +288,51 @@ fi
 if [[ $EDITION == "Java" ]]; then
   info "Installing Java (official Mojang vanilla) and server jar (as mcadmin)..."
   pct exec "$CTID" -- env MC_VER="$VERSION" bash -lc '
-    set -e
-    apt-get update
-    apt-get install -y openjdk-21-jre-headless curl jq screen
-    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
-    echo "mcadmin:changeme" | chpasswd
-    install -d -o mcadmin -g mcadmin /opt/minecraft
-    cd /opt/minecraft
-    VER="${MC_VER:-Latest}"
-    if [[ "$VER" == "Latest" || "$VER" == "latest" ]]; then
-      VER=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r ".latest.release")
-    fi
-    MANIFEST_URL=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg v "$VER" ".versions[] | select(.id==$v) | .url" | head -n1)
-    if [[ -z "$MANIFEST_URL" || "$MANIFEST_URL" == "null" ]]; then
-      echo "Requested version $VER not found; falling back to latest release" >&2
-      VER=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r ".latest.release")
-      MANIFEST_URL=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg v "$VER" ".versions[] | select(.id==$v) | .url" | head -n1)
-    fi
-    JAR_URL=$(curl -fsSL "$MANIFEST_URL" | jq -r ".downloads.server.url")
-    curl -fSL -o server.jar "$JAR_URL"
-    echo "eula=true" > eula.txt
-    chown -R mcadmin:mcadmin /opt/minecraft
-  '
+  set -euo pipefail
+  apt-get update
+  apt-get install -y openjdk-21-jre-headless curl jq screen
+  id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
+  echo "mcadmin:changeme" | chpasswd
+  install -d -o mcadmin -g mcadmin /opt/minecraft
+  cd /opt/minecraft
+
+  VER="${MC_VER:-Latest}"
+  MANIFEST_JSON="$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json)"
+
+  # Resolve "Latest" -> latest release id
+  if [[ "$VER" =~ ^[Ll]atest$ ]]; then
+    VER="$(printf "%s" "$MANIFEST_JSON" | jq -r '"'"'.latest.release'"'"')"
+  fi
+
+  # Find the per-version manifest URL (single quotes keep $v for jq, not the shell)
+  MANIFEST_URL="$(printf "%s" "$MANIFEST_JSON" \
+    | jq -r --arg v "$VER" '"'"'.versions[] | select(.id==$v) | .url'"'"' \
+    | head -n1)"
+
+  # If not found, fall back to latest release cleanly
+  if [[ -z "${MANIFEST_URL:-}" || "$MANIFEST_URL" == "null" ]]; then
+    echo "Requested version $VER not found; falling back to latest release" >&2
+    VER="$(printf "%s" "$MANIFEST_JSON" | jq -r '"'"'.latest.release'"'"')"
+    MANIFEST_URL="$(printf "%s" "$MANIFEST_JSON" \
+      | jq -r --arg v "$VER" '"'"'.versions[] | select(.id==$v) | .url'"'"' \
+      | head -n1)"
+  fi
+
+  if [[ -z "${MANIFEST_URL:-}" || "$MANIFEST_URL" == "null" ]]; then
+    echo "Could not resolve a valid per-version manifest URL. Aborting." >&2
+    exit 1
+  fi
+
+  JAR_URL="$(curl -fsSL "$MANIFEST_URL" | jq -r '"'"'.downloads.server.url'"'"')"
+  if [[ -z "${JAR_URL:-}" || "$JAR_URL" == "null" ]]; then
+    echo "Could not find server.jar URL in per-version manifest. Aborting." >&2
+    exit 1
+  fi
+
+  curl -fSL -o server.jar "$JAR_URL"
+  echo "eula=true" > eula.txt
+  chown -R mcadmin:mcadmin /opt/minecraft
+'
 
   info "Creating start script and service (runs as mcadmin)..."
   # Bake MEM into the script at creation time
@@ -349,6 +372,7 @@ else
     apt-get update
     apt-get install -y unzip curl screen
     id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
+    echo "mcadmin:changeme" | chpasswd
     install -d -o mcadmin -g mcadmin /opt/bedrock
     cd /opt/bedrock
     BEDROCK_URL=$(curl -fsSL https://www.minecraft.net/en-us/download/server/bedrock | grep -oE "https://minecraft\.azureedge\.net/bin-linux/bedrock-server-[0-9\.]+\.zip" | head -n1)
