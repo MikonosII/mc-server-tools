@@ -1,141 +1,164 @@
 #!/usr/bin/env bash
-# preflight.sh — prepare a newly-created LXC CT for reliable apt/networking + base OS sanity
-# - Forces APT to IPv4 on IPv6-less networks
-# - Prefers IPv4 in glibc resolver (for curl/wget, etc.)
-# - Rewrites sources.list to official mirrors (Ubuntu or Debian, auto-detected)
-# - Adds apt retries/timeouts
-# - Updates apt; installs curl + CA certs and common base packages
-# - Ensures noninteractive environment and UTF-8 locale
-# - Optional DNS fallback and IPv6 disable if no default route
-# - Provides MTU probe helper
-# - Creates mcadmin with provided password, enables SSH and sudo
+# preflight.sh — prepare LXC guest for Minecraft server install
+# - Forces APT to prefer IPv4 (helps in NAT'd/proxy'd environments)
+# - Tweaks /etc/gai.conf to prefer IPv4 for getaddrinfo()
+# - Detects OS/codename and writes a clean /etc/apt/sources.list
+# - Runs apt-get update with retries
+#
+# Can be sourced by other scripts or executed directly.
+# Idempotent: safe to re-run.
+
 set -euo pipefail
 
-# Usage (primary): preflight_net_apt <CTID>
-preflight_net_apt() {
-  local CTID="${1:?CTID required}"
+# --- Lightweight logging helpers (use repo's common.sh if present) ---
+if [ -f /usr/share/mc-server-tools/lib/common.sh ]; then
+  # shellcheck disable=SC1091
+  . /usr/share/mc-server-tools/lib/common.sh
+  : "${LOG_PREFIX:="[preflight] "}"
+  log() { printf "%s%s\n" "${LOG_PREFIX}" "$*"; }
+  warn() { printf "%sWARNING: %s\n" "${LOG_PREFIX}" "$*" >&2; }
+  err() { printf "%sERROR: %s\n" "${LOG_PREFIX}" "$*" >&2; }
+else
+  log()  { printf "[preflight] %s\n" "$*"; }
+  warn() { printf "[preflight] WARNING: %s\n" "$*" >&2; }
+  err()  { printf "[preflight] ERROR: %s\n" "$*" >&2; }
+fi
 
-  _in() { pct exec "$CTID" -- bash -lc "$*"; }
+# --- Noninteractive apt environment ---
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 
-  echo "[preflight] Forcing APT to IPv4…"
-  _in "install -d -m 0755 /etc/apt/apt.conf.d && printf 'Acquire::ForceIPv4 \"true\";\n' >/etc/apt/apt.conf.d/99force-ipv4"
+# --- Helpers ---
+retry() {
+  # retry <attempts> <delay_seconds> -- <command...>
+  local -i tries=$1; shift
+  local -i delay=$1; shift
+  local -i n=1
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if (( n >= tries )); then
+      return 1
+    fi
+    warn "command failed (attempt $n/$tries): $* ; retrying in ${delay}s…"
+    sleep "$delay"
+    ((n++))
+  done
+}
 
-  echo "[preflight] Preferring IPv4 in /etc/gai.conf…"
-  _in "grep -q '^precedence ::ffff:0:0/96 100$' /etc/gai.conf || echo 'precedence ::ffff:0:0/96 100' >> /etc/gai.conf"
+backup_once() {
+  # backup_once <path>
+  local p="$1"
+  if [ -f "$p" ] && [ ! -f "${p}.bak" ]; then
+    cp -a "$p" "${p}.bak"
+  fi
+}
 
-  echo "[preflight] Detecting OS family + codename…"
-  local OS_ID OS_CODENAME
-  OS_ID="$(_in 'source /etc/os-release && echo "$ID"')"
-  OS_CODENAME="$(_in 'source /etc/os-release && echo "$VERSION_CODENAME"')"
-  if [[ -z "$OS_ID" || -z "$OS_CODENAME" ]]; then
-    echo "[preflight] ERROR: Could not determine OS and codename from /etc/os-release" >&2
+force_apt_ipv4() {
+  # Create /etc/apt/apt.conf.d/99force-ipv4
+  local f="/etc/apt/apt.conf.d/99force-ipv4"
+  if ! grep -qs 'Acquire::ForceIPv4' "$f" 2>/dev/null; then
+    log "Forcing APT to IPv4…"
+    install -d -m 0755 /etc/apt/apt.conf.d
+    cat >"$f" <<'EOF'
+Acquire::ForceIPv4 "true";
+EOF
+  else
+    log "APT IPv4 preference already set."
+  fi
+}
+
+prefer_gai_ipv4() {
+  # Uncomment/append precedence to prefer IPv4 (RFC 6724 tweak)
+  local f="/etc/gai.conf"
+  if ! grep -qsE '^\s*precedence\s+::ffff:0:0/96\s+100' "$f" 2>/dev/null; then
+    log "Preferring IPv4 in /etc/gai.conf…"
+    if [ -f "$f" ]; then
+      backup_once "$f"
+      # If commented default exists, uncomment it; otherwise append a new line
+      if grep -qsE '^\s*#\s*precedence\s+::ffff:0:0/96\s+100' "$f"; then
+        sed -i -E 's/^\s*#\s*(precedence\s+::ffff:0:0\/96\s+100)/\1/' "$f"
+      else
+        echo 'precedence ::ffff:0:0/96 100' >>"$f"
+      fi
+    else
+      echo 'precedence ::ffff:0:0/96 100' >"$f"
+    fi
+  else
+    log "gai.conf already prefers IPv4."
+  fi
+}
+
+detect_os() {
+  # Sets globals: OS_ID, OS_CODENAME
+  OS_ID=""
+  OS_CODENAME=""
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-}"
+    OS_CODENAME="${VERSION_CODENAME:-}"
+  fi
+  if [ -z "$OS_ID" ] || [ -z "$OS_CODENAME" ]; then
+    err "Could not detect OS/codename from /etc/os-release"
     return 1
   fi
-  echo "[preflight] -> ID=${OS_ID}, CODENAME=${OS_CODENAME}"
-
-  echo "[preflight] Backing up sources.list (once)…"
-  _in "test -f /etc/apt/sources.list.bak || cp -a /etc/apt/sources.list /etc/apt/sources.list.bak || true"
-
-  echo "[preflight] Writing official mirrors to /etc/apt/sources.list…"
-  if [[ "$OS_ID" == "ubuntu" ]]; then
-    _in "cat > /etc/apt/sources.list <<'EOF'\n\
-deb http://archive.ubuntu.com/ubuntu ${OS_CODENAME} main restricted universe multiverse\n\
-deb http://archive.ubuntu.com/ubuntu ${OS_CODENAME}-updates main restricted universe multiverse\n\
-deb http://archive.ubuntu.com/ubuntu ${OS_CODENAME}-backports main restricted universe multiverse\n\
-deb http://security.ubuntu.com/ubuntu ${OS_CODENAME}-security main restricted universe multiverse\n\
-EOF"
-  elif [[ "$OS_ID" == "debian" ]]; then
-    _in "cat > /etc/apt/sources.list <<'EOF'\n\
-deb http://deb.debian.org/debian ${OS_CODENAME} main contrib non-free non-free-firmware\n\
-deb http://deb.debian.org/debian ${OS_CODENAME}-updates main contrib non-free non-free-firmware\n\
-deb http://deb.debian.org/debian ${OS_CODENAME}-backports main contrib non-free non-free-firmware\n\
-deb http://security.debian.org/debian-security ${OS_CODENAME}-security main contrib non-free non-free-firmware\n\
-EOF"
-  else
-    echo "[preflight] WARN: Unrecognized OS ID '${OS_ID}'. Leaving sources.list unchanged."
-  fi
-
-  echo "[preflight] Commenting out any stale custom mirrors (if present)…"
-  _in "grep -rlE 'mirror\\.|azureedge|pnl\\.gov|internal' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | xargs -r sed -i 's/^deb /# deb /'"
-
-  echo "[preflight] apt-get update…"
-  _in "DEBIAN_FRONTEND=noninteractive apt-get update -y"
-
-  echo "[preflight] Installing curl + ca-certificates…"
-  _in "DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates"
-
-  echo "[preflight] Hardening apt config (retries/timeouts)…"
-  _in "cat >/etc/apt/apt.conf.d/90mc-apt-hardening <<'EOF'\n\
-Acquire::Retries \"3\";\n\
-Acquire::http::Timeout \"30\";\n\
-Acquire::https::Timeout \"30\";\n\
-# Keep this file separate from 99force-ipv4 so we can flip either independently\n\
-EOF"
-
-  echo "[preflight] Ensuring base packages…"
-  _in "DEBIAN_FRONTEND=noninteractive apt-get install -y wget gnupg lsb-release iproute2 iputils-ping jq"
-
-  echo "[preflight] Default noninteractive profile…"
-  _in "cat >/etc/profile.d/90-noninteractive.sh <<'EOF'\nexport DEBIAN_FRONTEND=noninteractive\nEOF\nchmod +x /etc/profile.d/90-noninteractive.sh"
-
-  echo "[preflight] Locale = en_US.UTF-8…"
-  _in "\nset -e\nif ! dpkg -s locales >/dev/null 2>&1; then apt-get install -y locales; fi\nif ! grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen; then\n  sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen\nfi\nlocale-gen en_US.UTF-8\nupdate-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n"
-
-  echo "[preflight] DNS fallback (only if lookups fail)…"
-  _in "\nset -e\nif ! getent ahostsv4 archive.ubuntu.com >/dev/null 2>&1 && ! getent ahostsv4 deb.debian.org >/dev/null 2>&1; then\n  echo '[preflight] DNS lookup failed; writing fallback /etc/resolv.conf'\n  mkdir -p /run/systemd/resolve || true\n  chattr -i /etc/resolv.conf 2>/dev/null || true\n  cat >/etc/resolv.conf <<RESOLV\nnameserver 1.1.1.1\nnameserver 8.8.8.8\noptions edns0\nRESOLV\nfi\ntrue\n"
-
-  # OPTIONAL: If you want to auto-disable IPv6 when there is no v6 default route, uncomment:
-  # echo "[preflight] Disable IPv6 if there is no v6 default route…"
-  # _in "if ! ip -6 route | grep -q '^default'; then cat >/etc/sysctl.d/99-disable-ipv6.conf <<EOF\nnet.ipv6.conf.all.disable_ipv6=1\nnet.ipv6.conf.default.disable_ipv6=1\nEOF\n sysctl --system >/dev/null 2>&1 || true; fi"
-
-  echo "[preflight] Verifying IPv4 DNS + HTTP reachability…"
-  if [[ "$OS_ID" == "ubuntu" ]]; then
-    _in "getent ahostsv4 archive.ubuntu.com | head -n3 || true"
-    _in "curl -4 -I --max-time 10 http://archive.ubuntu.com/ubuntu/dists/${OS_CODENAME}/Release || true"
-    _in "curl -4 -I --max-time 10 http://security.ubuntu.com/ubuntu/dists/${OS_CODENAME}-security/Release || true"
-  elif [[ "$OS_ID" == "debian" ]]; then
-    _in "getent ahostsv4 deb.debian.org | head -n3 || true"
-    _in "curl -4 -I --max-time 10 http://deb.debian.org/debian/dists/${OS_CODENAME}/Release || true"
-    _in "curl -4 -I --max-time 10 http://security.debian.org/debian-security/dists/${OS_CODENAME}-security/Release || true"
-  fi
-
-  echo "[preflight] Done."
+  log "Detected OS=$OS_ID, CODENAME=$OS_CODENAME"
 }
 
-# Create mcadmin with a provided password (caller prompts)
-# Usage: preflight_create_mcadmin <CTID> <PASSWORD>
-preflight_create_mcadmin() {
-  local CTID="${1:?CTID required}"
-  local PASSWORD="${2:?PASSWORD required}"
+write_apt_sources() {
+  # Write a clean /etc/apt/sources.list for Ubuntu/Debian
+  # Mirrors can be overridden via env or config sourced earlier.
+  local UBU_MIRROR="${UBU_MIRROR:-http://archive.ubuntu.com/ubuntu}"
+  local SEC_MIRROR="${SEC_MIRROR:-http://security.ubuntu.com/ubuntu}"
+  local DEB_MIRROR="${DEB_MIRROR:-http://deb.debian.org/debian}"
+  local DEB_SEC_MIRROR="${DEB_SEC_MIRROR:-http://security.debian.org/debian-security}"
 
-  _in() { pct exec "$CTID" -- bash -lc "$*"; }
-
-  echo "[preflight] Installing sudo + openssh-server…"
-  _in "DEBIAN_FRONTEND=noninteractive apt-get install -y sudo openssh-server"
-
-  echo "[preflight] Ensuring mcadmin user exists and is in sudo…"
-  _in "\nset -e\nif id 'mcadmin' >/dev/null 2>&1; then\n  usermod -s /bin/bash 'mcadmin' || true\nelse\n  useradd -m -s /bin/bash 'mcadmin'\nfi\nusermod -aG sudo 'mcadmin'\n"
-
-  echo "[preflight] Setting mcadmin password (from user input)…"
-  local PASS_ESC
-  PASS_ESC="$(printf "%s" "$PASSWORD" | sed "s/'/'\\''/g")"
-  _in "echo 'mcadmin:${PASS_ESC}' | chpasswd"
-
-  echo "[preflight] Hardening SSH (disable root password login, allow mcadmin)…"
-  _in "\nset -e\nsystemctl enable ssh >/dev/null 2>&1 || systemctl enable sshd >/dev/null 2>&1 || true\nsystemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true\n\nif grep -qE '^#?PermitRootLogin' /etc/ssh/sshd_config; then\n  sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config\nelse\n  echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config\nfi\npasswd -l root >/dev/null 2>&1 || true\n\nif grep -qE '^#?PasswordAuthentication' /etc/ssh/sshd_config; then\n  sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config\nelse\n  echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config\nfi\nsystemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true\n"
-
-  echo "[preflight] mcadmin ready with user-specified password."
+  case "$OS_ID" in
+    ubuntu)
+      log "Writing official Ubuntu mirrors to /etc/apt/sources.list…"
+      backup_once /etc/apt/sources.list
+      cat >/etc/apt/sources.list <<EOF
+deb ${UBU_MIRROR} ${OS_CODENAME} main restricted universe multiverse
+deb ${UBU_MIRROR} ${OS_CODENAME}-updates main restricted universe multiverse
+deb ${UBU_MIRROR} ${OS_CODENAME}-backports main restricted universe multiverse
+deb ${SEC_MIRROR} ${OS_CODENAME}-security main restricted universe multiverse
+EOF
+      ;;
+    debian)
+      log "Writing official Debian mirrors to /etc/apt/sources.list…"
+      backup_once /etc/apt/sources.list
+      cat >/etc/apt/sources.list <<EOF
+deb ${DEB_MIRROR} ${OS_CODENAME} main contrib non-free non-free-firmware
+deb ${DEB_MIRROR} ${OS_CODENAME}-updates main contrib non-free non-free-firmware
+deb ${DEB_MIRROR} ${OS_CODENAME}-backports main contrib non-free non-free-firmware
+deb ${DEB_SEC_MIRROR} ${OS_CODENAME}-security main contrib non-free non-free-firmware
+EOF
+      ;;
+    *)
+      warn "Unknown distro ID='${OS_ID}', leaving sources.list unchanged."
+      ;;
+  esac
 }
 
-# Optional: MTU helper (prints recommendation only)
-# Usage: preflight_probe_mtu <CTID>
-preflight_probe_mtu() {
-  local CTID="${1:?CTID required}"
-  pct exec "$CTID" -- bash -lc '
-best=1472
-for sz in 1472 1460 1452 1440 1420 1400 1380 1360 1340 1320 1300; do
-  if ping -c1 -M do -s "$sz" 8.8.8.8 >/dev/null 2>&1; then best="$sz"; break; fi
-done
-echo "Max ICMP payload without fragmentation: $best (MTU ~= best + 28)"
-'
+apt_update() {
+  log "Updating APT package lists…"
+  # Use retries; APT is finicky in new CTs, especially right after first boot
+  retry 4 5 bash -lc 'apt-get update -o Acquire::ForceIPv4=true -y'
 }
+
+# --- Main flow (when executed directly) ---
+main() {
+  force_apt_ipv4
+  prefer_gai_ipv4
+  detect_os
+  write_apt_sources
+  apt_update
+  log "Preflight complete."
+}
+
+# If sourced, don't run main. If executed, run main.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
