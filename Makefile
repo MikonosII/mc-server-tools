@@ -14,22 +14,23 @@ PKG           := mc-server-tools
 ARCH          := all
 
 # --- Automatic versioning from git describe ---
-# Formats:
-#   v1.2.3-4-gABCDEF  ->  1.2.3+git4.ABCDEF
-#   v1.2.3            ->  1.2.3
 GIT_DESCRIBE  := $(shell git describe --tags --long --always --dirty 2>/dev/null || true)
+
 ifneq ($(strip $(GIT_DESCRIBE)),)
-  VERSION_BASE := $(shell echo "$(GIT_DESCRIBE)" | sed -E 's/^v?([0-9]+(\.[0-9]+)*).*/\1/')
-  VERSION_COMM := $(shell echo "$(GIT_DESCRIBE)" | sed -nE 's/^v?[0-9.]+-([0-9]+)-.*/\1/p')
-  VERSION_SHA7 := $(shell echo "$(GIT_DESCRIBE)" | sed -nE 's/.*-g([0-9a-fA-F]+).*/\1/p' | cut -c1-7)
-  ifneq ($(strip $(VERSION_COMM)),)
-    VERSION := $(VERSION_BASE)+git$(VERSION_COMM).$(VERSION_SHA7)
+  # Example: v0.0.44-0-gac8e3fd
+  VERSION_TAG   := $(shell echo "$(GIT_DESCRIBE)" | sed -E 's/^v?([0-9]+(\.[0-9]+)*).*/\1/')
+  VERSION_COMM  := $(shell echo "$(GIT_DESCRIBE)" | sed -nE 's/^v?[0-9.]+-([0-9]+)-.*/\1/p')
+  VERSION_SHA7  := $(shell echo "$(GIT_DESCRIBE)" | sed -nE 's/.*-g([0-9a-fA-F]+).*/\1/p' | cut -c1-7)
+
+  ifeq ($(VERSION_COMM),0)
+    VERSION := $(VERSION_TAG)       # exactly on a tag → clean version
   else
-    VERSION := $(VERSION_BASE)
+    VERSION := $(VERSION_TAG)+git$(VERSION_COMM).$(VERSION_SHA7)
   endif
 else
   VERSION := 0.0.0+local.$(shell date -u +%Y%m%d%H%M)
 endif
+
 
 # --- Inputs ---
 DISPATCHER    := usr/bin/mc
