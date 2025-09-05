@@ -10,6 +10,11 @@ require_root() {
   fi
 }
 
+# Logging helpers used by mc-setup
+info() { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+err()  { echo "[ERROR] $*" >&2; }
+
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "[mc] $*"; }
 
