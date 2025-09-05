@@ -3,8 +3,8 @@ name: Release .deb on tag
 on:
   push:
     tags:
-      - 'v*'              # push a tag like v1.2.3
-  workflow_dispatch:       # allow manual runs (builds artifact; skips Release step)
+      - 'v*'
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -32,31 +32,39 @@ jobs:
           ls -lh *.deb
           dpkg-deb -I *.deb || true
 
+      - name: Capture .deb filename (and URL-safe variant)
+        id: deb
+        shell: bash
+        run: |
+          set -e
+          FILE="$(ls -1 *.deb | head -n1)"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          # Encode '+' as %2B for URLs (GitHub serves raw asset by exact name)
+          URL_FILE="${FILE//+/%2B}"
+          echo "url_file=$URL_FILE" >> "$GITHUB_OUTPUT"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mc-server-tools-${{ github.ref_name }}
-          path: "*.deb"
+          name: ${{ steps.deb.outputs.file }}
+          path: ${{ steps.deb.outputs.file }}
+          compression-level: 0
 
-      # Only create a GitHub Release if this run was triggered by a tag
+      # Only create a Release when running on a tag
       - name: Create GitHub Release and attach .deb (with install notes)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: "*.deb"
+          files: ${{ steps.deb.outputs.file }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
           body: |
             ## Install with wget + apt
 
             ```bash
-
-            # Download from this release
-            wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mc-server-tools_${{ github.ref_name }}_all.deb"
-
-            # Install (resolves dependencies automatically)
+            wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.deb.outputs.url_file }}"
             sudo apt-get update
-            sudo apt-get install -y "./mc-server-tools_${{ github.ref_name }}_all.deb"
+            sudo apt-get install -y "./${{ steps.deb.outputs.file }}"
 
             # Quick smoke test
             mc --help
