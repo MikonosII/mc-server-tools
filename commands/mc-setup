@@ -3,6 +3,8 @@ set -euo pipefail
 
 . /usr/share/mc-server-tools/lib/common.sh
 require_root
+# Default disk size
+DISK_GB=${DISK_GB:-16G}
 # Load networking config (create defaults if missing)
 CONFIG_FILE="/etc/mc-server-tools/config"
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -15,6 +17,7 @@ NET_JAVA_GW="auto"
 NET_BEDROCK_START="192.168.206.100"
 NET_BEDROCK_PREFIX="24"
 NET_BEDROCK_GW="auto"
+DEFAULT_TEMPLATE=""
 EOF
 fi
 # shellcheck disable=SC1090
@@ -99,8 +102,25 @@ next_free_ip() { # $1=seed_ip $2=prefix
   return 1
 }
 
-LAST_TEMPLATE_FILE="/var/lib/mc-server-tools/last-template"
-mkdir -p /var/lib/mc-server-tools
+# Template persistence & discovery
+installed_templates() {
+  local storages; storages=$(pvesm status 2>/dev/null | awk '$2=="dir"{print $1}')
+  local s
+  for s in $storages; do
+    pveam list "$s" 2>/dev/null | awk -v S="$s" 'NR>1 && $2!="" {printf "%s:vztmpl/%s
+", S, $2}'
+  done
+}
+
+set_config_var() { # $1=KEY $2=VALUE
+  local key="$1" val="$2"
+  if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+    sed -i "s#^${key}=.*#${key}=\"${val//\//\/}\"#" "$CONFIG_FILE"
+  else
+    printf '%s="%s"
+' "$key" "$val" >> "$CONFIG_FILE"
+  fi
+}
 
 # Optional non-interactive flags for automation
 EDITION=""; VERSION=""; HN=""; MEM=""; CORES=""; BKT=""; CTID_IN=""; PORT_IN=""; TEMPLATE_IN=""
@@ -167,31 +187,36 @@ next_free_ctid_port() {
 }
 
 select_template() {
-  local templates
-  templates=$(pveam available --section system | awk '{print $2}')
-  [[ -z "$templates" ]] && { err "No templates found. Use 'pveam download' first."; exit 1; }
+  local list; list=$(installed_templates)
+  [[ -n "$list" ]] || { err "No installed templates found. Use 'pveam download local <name>' first."; exit 1; }
 
-  local default=""
-  [[ -f "$LAST_TEMPLATE_FILE" ]] && default=$(cat "$LAST_TEMPLATE_FILE")
-
-  echo "Available templates:"
-  local i=1
-  local arr=()
-  while read -r t; do arr+=("$t"); echo "  $i) $t"; i=$((i+1)); done <<< "$templates"
+  echo "Installed templates:";
+  local arr=(); local i=1
+  while read -r t; do arr+=("$t"); echo "  $i) $t"; i=$((i+1)); done <<< "$list"
   echo
 
-  local choice
-  read -r -p "Choose template [${default:-1}]: " choice
+  # Default from config if present and matches; otherwise first entry
+  local default="${DEFAULT_TEMPLATE:-}"
+  local def_idx=""
+  if [[ -n "$default" ]]; then
+    for idx in "${!arr[@]}"; do [[ "${arr[$idx]}" == "$default" ]] && def_idx=$((idx+1)); done
+  fi
+  if [[ -z "$def_idx" ]]; then default="${arr[0]}"; def_idx=1; fi
 
+  local choice sel
+  read -r -p "Choose template [${def_idx}]: " choice
   if [[ -z "$choice" ]]; then
-    if [[ -n "$default" ]]; then TEMPLATE="$default"; else TEMPLATE="${arr[0]}"; fi
+    sel="$default"
   elif [[ "$choice" =~ ^[0-9]+$ ]]; then
-    TEMPLATE="${arr[$((choice-1))]}"
+    sel="${arr[$((choice-1))]}"
   else
-    TEMPLATE="$choice"
+    # allow typing full storage:path
+    sel="$choice"
   fi
 
-  echo "$TEMPLATE" > "$LAST_TEMPLATE_FILE"
+  # Persist for next time
+  set_config_var DEFAULT_TEMPLATE "$sel"
+  echo "$sel"
 }
 
 # Edition
@@ -256,12 +281,12 @@ if [[ -z "$HN" ]]; then
   HN=${HN:-mc-$CTID}
 fi
 
-# Template selection
+# Template selection (installed-only; persists to config)
 if [[ -z "$TEMPLATE_IN" ]]; then
   TEMPLATE=$(select_template)
 else
   TEMPLATE=$TEMPLATE_IN
-  echo "$TEMPLATE" > "$LAST_TEMPLATE_FILE"
+  set_config_var DEFAULT_TEMPLATE "$TEMPLATE"
 fi
 
 info "Summary"
@@ -309,7 +334,7 @@ if [[ $EDITION == "Java" ]]; then
   '
 
   info "Creating start script and service (runs as mcadmin)..."
-  pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start << "EOS"
+  pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start << EOS
 #!/usr/bin/env bash
 set -e
 cd /opt/minecraft
@@ -344,7 +369,14 @@ else
     id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
     install -d -o mcadmin -g mcadmin /opt/bedrock
     cd /opt/bedrock
-    curl -fsSL -o bedrock-server.zip https://minecraft.net/en-us/download/server/bedrock
+    # Find the official direct ZIP link from the download page
+BEDROCK_URL=$(curl -fsSL https://www.minecraft.net/en-us/download/server/bedrock \
+  | grep -oE "https://minecraft\.azureedge\.net/bin-linux/bedrock-server-[0-9\.]+\.zip" \
+  | head -n1)
+if [[ -z "$BEDROCK_URL" ]]; then
+  echo "Failed to detect Bedrock server URL" >&2; exit 1
+fi
+curl -fsSL -o bedrock-server.zip "$BEDROCK_URL"
     unzip -o bedrock-server.zip
     chown -R mcadmin:mcadmin /opt/bedrock
   '
