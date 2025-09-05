@@ -63,8 +63,8 @@ jobs:
 
             ```bash
             wget -q "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.deb.outputs.url_file }}"
-            sudo apt-get update
-            sudo apt-get install -y "./${{ steps.deb.outputs.file }}"
+            apt-get update
+            apt-get install -y "./${{ steps.deb.outputs.file }}"
 
             # Quick smoke test
             mc --help
