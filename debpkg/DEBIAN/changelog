@@ -1,7 +1,5 @@
-mc-server-tools (2.0.0) unstable; urgency=medium
+mc-server-tools (1.0.0) unstable; urgency=low
 
-  * Add preflight hardening and mcadmin password prompt
-  * Move mirrors/IPv4/locale setup to preflight
-  * Add mc-preflight helper and common logging funcs
+  * Initial release
 
- -- Your Name <you@example.com>  Fri, 05 Sep 2025 12:00:00 -0500
+ -- mc-server-tools <noreply@example.com>  Fri, 05 Sep 2025 12:00:00 -0500
