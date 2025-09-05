@@ -31,7 +31,16 @@ install:
 	$(INSTALL) -m 0644 $(FILES_LIB) $(DESTDIR)$(LIB_DIR)/
 	$(INSTALL) -m 0755 $(FILES_CMDS) $(DESTDIR)$(CMD_DIR)/
 	$(INSTALL) -m 0755 $(FILES_BIN)  $(DESTDIR)$(BIN_DIR)/
-	$(INSTALL) -m 0755 $(WRAPPER_SRC) $(DESTDIR)$(WRAPPER_BIN)
+	# mc-setup wrapper on PATH
+	if [ -f $(WRAPPER_SRC) ]; then \
+	  $(INSTALL) -m 0755 $(WRAPPER_SRC) $(DESTDIR)$(WRAPPER_BIN); \
+	else \
+	  printf '%s\n' '#!/usr/bin/env bash' \
+	    'exec /usr/bin/env bash /usr/share/mc-server-tools/commands/mc-setup "$$@"' \
+	    > $(DESTDIR)$(WRAPPER_BIN); \
+	  chmod 0755 $(DESTDIR)$(WRAPPER_BIN); \
+	fi
+
 
 uninstall:
 	rm -f $(DESTDIR)$(BIN_DIR)/mc-preflight
