@@ -213,9 +213,11 @@ fi
 if [[ -z "$HN" ]]; then read -r -p "Hostname [mc-$CTID]: " HN; HN=${HN:-mc-$CTID}; fi
 
 # --- Template selection via helper (no default unless saved & valid) ---
-TEMPLATE="$(/usr/bin/env bash /usr/share/mc-server-tools/commands/mc-select-template \
-  --template "${TEMPLATE_IN:-}" \
-  --default  "${DEFAULT_TEMPLATE:-}")"
+TEMPLATE="$(
+  /usr/bin/env bash /usr/share/mc-server-tools/commands/mc-select-template \
+    --template "${TEMPLATE_IN:-}" \
+    --default  "${DEFAULT_TEMPLATE:-}"
+)"
 set_config_var DEFAULT_TEMPLATE "$TEMPLATE"
 
 # RootFS storage (prefer local-lvm, else local)
