@@ -148,6 +148,38 @@ apt_update() {
   retry 4 5 bash -lc 'apt-get update -o Acquire::ForceIPv4=true -y'
 }
 
+# --- Functions expected by mc-setup ---
+
+# Run network/apt hardening inside the container
+preflight_net_apt() {
+  local ctid="$1"
+  if [ -z "$ctid" ]; then
+    err "preflight_net_apt: missing CTID argument"
+    return 1
+  fi
+  log "Running preflight networking/apt hardening in CT $ctid…"
+  pct exec "$ctid" -- bash -lc '/usr/share/mc-server-tools/lib/preflight.sh'
+}
+
+# Create mcadmin user inside the container
+preflight_create_mcadmin() {
+  local ctid="$1" pass="$2"
+  if [ -z "$ctid" ] || [ -z "$pass" ]; then
+    err "preflight_create_mcadmin: missing arguments"
+    return 1
+  fi
+  log "Creating mcadmin user in CT $ctid…"
+  pct exec "$ctid" -- bash -lc "
+    set -euo pipefail
+    if ! id mcadmin >/dev/null 2>&1; then
+      adduser --disabled-password --gecos '' mcadmin
+    fi
+    echo 'mcadmin:${pass}' | chpasswd
+    usermod -aG sudo mcadmin
+  "
+}
+
+
 # --- Main flow (when executed directly) ---
 main() {
   force_apt_ipv4
