@@ -31,14 +31,14 @@ else
   VERSION := 0.0.0+local.$(shell date -u +%Y%m%d%H%M)
 endif
 
-# <<< add this line >>>
-VERSION := $(strip $(VERSION))
-
 # --- Inputs ---
 DISPATCHER    := usr/bin/mc
-COMMANDS := $(shell [ -d commands ] && find commands -maxdepth 1 -type f ! -name 'README*' ! -name '*.md' -print | sort || true)
-LIBS     := $(shell [ -d lib ] && find lib      -maxdepth 1 -type f -print | sort || true)
+COMMANDS      := $(shell [ -d commands ] && find commands -maxdepth 1 -type f ! -name 'README*' ! -name '*.md' -print | sort || true)
+LIBS          := $(shell [ -d lib ] && find lib -maxdepth 1 -type f -print | sort || true)
 CONF_DEFAULT  := debpkg/etc/config
+
+# Normalize VERSION
+VERSION := $(strip $(VERSION))
 
 # --- Staging / output paths ---
 BUILDROOT     := build
@@ -76,18 +76,21 @@ tree:
 	         "$(PKGROOT)$(SYSCONFDIR)"
 	# Dispatcher
 	install -m0755 "$(DISPATCHER)" "$(PKGROOT)$(BINDIR)/mc"
+
 	# Commands (install if any)
-ifneq ($(strip $(COMMANDS)),)
-	install -m0755 $(COMMANDS) "$(PKGROOT)$(CMDDIR)/"
-else
-	@echo "[tree] (no commands found under ./commands)"
-endif
+	ifneq ($(strip $(COMMANDS)),)
+		install -m0755 $(COMMANDS) "$(PKGROOT)$(CMDDIR)/"
+	else
+		@echo "[tree] (no commands found under ./commands)"
+	endif
+
 	# Libraries (install if any)
-ifneq ($(strip $(LIBS)),)
-	install -m0644 $(LIBS) "$(PKGROOT)$(LIBDIR)/"
-else
-	@echo "[tree] (no libs found under ./lib)"
-endif
+	ifneq ($(strip $(LIBS)),)
+		install -m0644 $(LIBS) "$(PKGROOT)$(LIBDIR)/"
+	else
+		@echo "[tree] (no libs found under ./lib)"
+	endif
+
 	# Default config
 	if [ -f "debpkg/etc/config" ]; then install -m0644 "debpkg/etc/config" "$(PKGROOT)$(SYSCONFDIR)/config"; fi
 
