@@ -31,6 +31,8 @@ else
   VERSION := 0.0.0+local.$(shell date -u +%Y%m%d%H%M)
 endif
 
+# <<< add this line >>>
+VERSION := $(strip $(VERSION))
 
 # --- Inputs ---
 DISPATCHER    := usr/bin/mc
