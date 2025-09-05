@@ -1,114 +1,176 @@
 #!/usr/bin/env bash
 # mc-select-template — interactive template picker for mc-setup
-# Echoes exactly one value: storage:vztmpl/<file>
+# Prints exactly one value on stdout:  storage:vztmpl/<file>
+# Behavior:
+#   - If --template matches an installed template (fully-qualified), prints it.
+#   - If --template is a bare filename and uniquely matches, prints that match.
+#   - Otherwise, lists installed templates and prompts the user.
+#   - If none installed, offers to download via pveam, then prints the result.
+
+# Always run under bash
 if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 set -euo pipefail
 
 TEMPLATE_IN=""
 DEFAULT_TEMPLATE=""
 
+# --- arg parse ---
 while [ $# -gt 0 ]; do
   case "$1" in
-    --template) TEMPLATE_IN="${2:-}"; shift 2;;
-    --default)  DEFAULT_TEMPLATE="${2:-}"; shift 2;;
-    *) break;;
+    --template) TEMPLATE_IN="${2:-}"; shift 2 ;;
+    --default)  DEFAULT_TEMPLATE="${2:-}"; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
   esac
 done
 
+# --- helpers ---
 is_installed() {
-  sel="$1"
+  # $1 = storage:vztmpl/file
+  local sel="$1" storage file cache
   case "$sel" in
     *:vztmpl/*)
       storage="${sel%%:vztmpl/*}"
       file="${sel##*:vztmpl/}"
-      [ "$storage" = "local" ] && cache=/var/lib/vz/template/cache || cache="/mnt/pve/$storage/template/cache"
+      if [ "$storage" = "local" ]; then
+        cache="/var/lib/vz/template/cache"
+      else
+        cache="/mnt/pve/$storage/template/cache"
+      fi
       [ -f "$cache/$file" ]
       ;;
-    *) return 1;;
+    *) return 1 ;;
   esac
 }
 
+list_installed() {
+  # emits "storage:vztmpl/file" per line
+  local s path
+  # list storages known to Proxmox
+  pvesm status 2>/dev/null | awk 'NR>1{print $1}' | while read -r s; do
+    if [ "$s" = "local" ]; then
+      path="/var/lib/vz/template/cache"
+    else
+      path="/mnt/pve/$s/template/cache"
+    fi
+    if [ -d "$path" ]; then
+      find "$path" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | while read -r f; do
+        printf '%s:vztmpl/%s\n' "$s" "$f"
+      done
+    fi
+  done
+}
+
+pick_storage() {
+  # prints chosen storage name
+  local S_LIST def_idx pick storage
+  S_LIST="$(mktemp)"; trap 'rm -f "$S_LIST"' RETURN
+  pvesm status 2>/dev/null | awk 'NR>1{print $1}' >"$S_LIST"
+  if ! [ -s "$S_LIST" ]; then
+    echo "No storages found via pvesm status." >&2
+    return 1
+  fi
+  def_idx="$(nl -w1 -s: "$S_LIST" | awk -F: '$2=="local"{print $1; f=1; exit} END{if(!f) print 1}')"
+  echo "Storages:" >&2
+  nl -w1 -s'. ' "$S_LIST" >&2
+  echo >&2
+  read -r -p "Choose storage for download [${def_idx}]: " pick
+  if [ -z "$pick" ]; then
+    storage="$(sed -n "${def_idx}p" "$S_LIST")"
+  elif printf '%s\n' "$pick" | grep -Eq '^[0-9]+$'; then
+    storage="$(sed -n "${pick}p" "$S_LIST")"
+  else
+    storage="$pick"
+  fi
+  [ -n "$storage" ] || { echo "No storage selected." >&2; return 1; }
+  printf '%s\n' "$storage"
+}
+
+download_template() {
+  # offers a catalog & downloads; prints "storage:vztmpl/file" on success
+  local storage name C_LIST t
+  storage="$(pick_storage)" || return 1
+
+  C_LIST="$(mktemp)"; trap 'rm -f "$C_LIST"' RETURN
+  # Try section-filtered, fall back to unfiltered for older PVE
+  if ! pveam available --section system 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' >"$C_LIST"; then
+    pveam available 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' >"$C_LIST" || true
+  fi
+  if ! [ -s "$C_LIST" ]; then
+    echo "No catalog entries returned by pveam." >&2
+    return 1
+  fi
+
+  echo "Available templates (first 20 shown):" >&2
+  head -n 20 "$C_LIST" | nl -w1 -s'. ' >&2
+  echo >&2
+  read -r -p "Download which? (number or full name) [1]: " t
+  if [ -z "$t" ]; then
+    name="$(sed -n '1p' "$C_LIST")"
+  elif printf '%s\n' "$t" | grep -Eq '^[0-9]+$'; then
+    name="$(sed -n "${t}p" "$C_LIST")"
+  else
+    name="$t"
+  fi
+  [ -n "$name" ] || { echo "No template selected." >&2; return 1; }
+
+  echo "-- Downloading $name to $storage..." >&2
+  pveam download "$storage" "$name"
+  printf '%s:vztmpl/%s\n' "$storage" "$name"
+}
+
+# --- main logic ---
+
 # Build installed list
 T_LIST="$(mktemp)"; trap 'rm -f "$T_LIST"' EXIT
-pvesm status 2>/dev/null | awk 'NR>1{print $1}' | while read -r s; do
-  if [ "$s" = "local" ]; then path=/var/lib/vz/template/cache; else path="/mnt/pve/$s/template/cache"; fi
-  if [ -d "$path" ]; then
-    find "$path" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | while read -r f; do
-      printf '%s:vztmpl/%s\n' "$s" "$f"
-    done
-  fi
-done >"$T_LIST"
+list_installed >"$T_LIST"
+count="$(wc -l < "$T_LIST" | tr -d '[:space:]')"
 
-count="$(wc -l < "$T_LIST" | tr -d ' ')"
-
-# Accept fully-qualified installed
+# 1) Fully-qualified input that is already installed
 if [ -n "$TEMPLATE_IN" ] && is_installed "$TEMPLATE_IN"; then
-  printf '%s\n' "$TEMPLATE_IN"; exit 0
+  printf '%s\n' "$TEMPLATE_IN"
+  exit 0
 fi
 
-# Bare filename unique match
+# 2) Bare filename unique match among installed
 if [ -n "$TEMPLATE_IN" ] && printf '%s' "$TEMPLATE_IN" | grep -vq ':vztmpl/'; then
-  matches=0; last=""
+  matches=0 last=""
   while IFS= read -r line; do
     fn="${line##*:vztmpl/}"
-    [ "$fn" = "$TEMPLATE_IN" ] && { matches=$((matches+1)); last="$line"; }
+    if [ "$fn" = "$TEMPLATE_IN" ]; then
+      matches=$((matches+1)); last="$line"
+    fi
   done < "$T_LIST"
-  [ "$matches" -eq 1 ] && { printf '%s\n' "$last"; exit 0; }
+  if [ "$matches" -eq 1 ]; then
+    printf '%s\n' "$last"
+    exit 0
+  fi
 fi
 
-# No installed — offer download
+# 3) No installed templates => offer download
 if [ "$count" -eq 0 ]; then
   echo "No installed templates found." >&2
   read -r -p "Download a template now? [Y/n]: " ans; ans="${ans:-Y}"
-  case "$ans" in Y|y)
-    S_LIST="$(mktemp)"; trap 'rm -f "$S_LIST"' EXIT
-    pvesm status 2>/dev/null | awk 'NR>1{print $1}' >"$S_LIST"
-    [ -s "$S_LIST" ] || { echo "No storages found via pvesm status" >&2; exit 1; }
-    def_idx="$(nl -w1 -s: "$S_LIST" | awk -F: '$2=="local"{print $1; f=1; exit} END{if(!f) print 1}')"
-    echo "Storages:" >&2; nl -w1 -s'. ' "$S_LIST" >&2; echo >&2
-    read -r -p "Choose storage for download [${def_idx}]: " pick
-    if [ -z "$pick" ]; then storage="$(sed -n "${def_idx}p" "$S_LIST")"
-    elif printf '%s\n' "$pick" | grep -Eq '^[0-9]+$'; then storage="$(sed -n "${pick}p" "$S_LIST")"
-    else storage="$pick"; fi
-    [ -n "$storage" ] || { echo "No storage selected" >&2; exit 1; }
-
-    C_LIST="$(mktemp)"; trap 'rm -f "$C_LIST"' EXIT
-    pveam available --section system 2>/div/null | awk 'NR>1 && $2!="" {print $2}' >"$C_LIST" || true
-    if ! [ -s "$C_LIST" ]; then
-      # Fallback without --section (older PVE)
-      pveam available 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' >"$C_LIST"
-    fi
-    [ -s "$C_LIST" ] || { echo "No catalog entries from pveam" >&2; exit 1; }
-    echo "Available templates (top 20):" >&2; head -n 20 "$C_LIST" | nl -w1 -s'. ' >&2; echo >&2
-    read -r -p "Download which? (number or full name) [1]: " t
-    if [ -z "$t" ]; then name="$(sed -n '1p' "$C_LIST")"
-    elif printf '%s\n' "$t" | grep -Eq '^[0-9]+$'; then name="$(sed -n "${t}p" "$C_LIST")"
-    else name="$t"; fi
-    [ -n "$name" ] || { echo "No template selected" >&2; exit 1; }
-    echo "-- Downloading $name to $storage..." >&2
-    pveam download "$storage" "$name"
-    printf '%s:vztmpl/%s\n' "$storage" "$name"; exit 0
-    ;;
+  case "$ans" in
+    Y|y) download_template; exit 0 ;;
+    *)   echo "Aborting: no templates installed." >&2; exit 1 ;;
   esac
-  echo "Aborting: no templates installed." >&2
-  exit 1
 fi
 
-# Menu of installed
+# 4) Menu of installed templates
 echo "Installed templates:" >&2
-i=1
-while IFS= read -r line; do
-  printf '  %d. %s\n' "$i" "$line" >&2
-  i=$(expr $i + 1)
-done < "$T_LIST"
+nl -w1 -s'. ' "$T_LIST" >&2
 echo >&2
 
-# Default only if matches installed
+# Determine default index if DEFAULT_TEMPLATE matches an installed line
 def_idx=""
 idx=1
 while IFS= read -r line; do
-  if [ -n "$DEFAULT_TEMPLATE" ] && [ "$line" = "$DEFAULT_TEMPLATE" ]; then def_idx="$idx"; break; fi
-  idx=$(expr $idx + 1)
+  if [ -n "$DEFAULT_TEMPLATE" ] && [ "$line" = "$DEFAULT_TEMPLATE" ]; then
+    def_idx="$idx"
+    break
+  fi
+  idx=$((idx+1))
 done < "$T_LIST"
 
 if [ -n "$def_idx" ]; then
@@ -120,27 +182,55 @@ fi
 while :; do
   read -r -p "$prompt" choice
   if [ -z "$choice" ]; then
-    [ -n "$def_idx" ] && { sel="$(sed -n "${def_idx}p" "$T_LIST")"; printf '%s\n' "$sel"; exit 0; }
-    echo "Please enter a number or 'd' to download." >&2; continue
+    if [ -n "$def_idx" ]; then
+      sel="$(sed -n "${def_idx}p" "$T_LIST")"
+      printf '%s\n' "$sel"
+      exit 0
+    fi
+    echo "Please enter a number or 'd' to download." >&2
+    continue
   fi
+
   if printf '%s\n' "$choice" | grep -Eq '^[0-9]+$'; then
     sel="$(sed -n "${choice}p" "$T_LIST")"
-    [ -n "$sel" ] && { printf '%s\n' "$sel"; exit 0; }
-    echo "Invalid number" >&2; continue
+    if [ -n "$sel" ]; then
+      printf '%s\n' "$sel"
+      exit 0
+    fi
+    echo "Invalid number." >&2
+    continue
   fi
+
   if printf '%s\n' "$choice" | grep -Eq '^[dD]$'; then
-    exec "$0" --default "${DEFAULT_TEMPLATE:-}"
+    download_template
+    exit 0
   fi
-  raw="$choice"
-  if printf '%s' "$raw" | grep -q ':vztmpl/'; then
-    if is_installed "$raw"; then printf '%s\n' "$raw"; exit 0; fi
-    echo "Template '$raw' not installed." >&2; continue
+
+  # allow typing a full "storage:vztmpl/file"
+  if printf '%s' "$choice" | grep -q ':vztmpl/'; then
+    if is_installed "$choice"; then
+      printf '%s\n' "$choice"
+      exit 0
+    fi
+    echo "Template '$choice' not installed." >&2
+    continue
   fi
-  matches=0; last=""
+
+  # allow typing a bare filename if unique
+  matches=0 last=""
   while IFS= read -r line; do
-    fn="${line##*:vztmpl/}"; [ "$fn" = "$raw" ] && { matches=$(expr $matches + 1); last="$line"; }
+    fn="${line##*:vztmpl/}"
+    if [ "$fn" = "$choice" ]; then
+      matches=$((matches+1)); last="$line"
+    fi
   done < "$T_LIST"
-  [ "$matches" -eq 1 ] && { printf '%s\n' "$last"; exit 0; }
-  [ "$matches" -gt 1 ] && { echo "Filename '$raw' is ambiguous; pick a number." >&2; continue; }
-  echo "Filename '$raw' not found; pick a number or 'd' to download." >&2
+
+  if [ "$matches" -eq 1 ]; then
+    printf '%s\n' "$last"
+    exit 0
+  elif [ "$matches" -gt 1 ]; then
+    echo "Filename '$choice' is ambiguous; pick a number." >&2
+  else
+    echo "Filename '$choice' not found; pick a number or 'd' to download." >&2
+  fi
 done
