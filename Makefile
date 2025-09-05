@@ -34,11 +34,12 @@ install:
 	install -d "$(DESTDIR)$(BINDIR)" \
 	         "$(DESTDIR)$(CMDDIR)" \
 	         "$(DESTDIR)$(LIBDIR)" \
-	         "$(DESTDIR)$(SYSCONFDIR)"
+	         "$(DESTDIR)$(SYSCONFDIR)" \
+			 "$(DESTDIR)/bin"
 	# main dispatcher
 	install -m0755 "$(DISPATCHER)" "$(DESTDIR)$(BINDIR)/mc"
 	# optional wrapper for compatibility (/bin/mc -> /usr/bin/mc)
-	install -m0755 "$(WRAPPER)" "/$(DESTDIR)bin/mc" || true
+	install -m0755 "$(WRAPPER)" "$(DESTDIR)/bin/mc" || true
 	# commands + libs
 	install -m0755 $(COMMANDS) "$(DESTDIR)$(CMDDIR)/"
 	install -m0644 $(LIBS)      "$(DESTDIR)$(LIBDIR)/"
@@ -75,7 +76,8 @@ tree:
 	install -d "$(PKGROOT)$(BINDIR)" \
 	         "$(PKGROOT)$(CMDDIR)" \
 	         "$(PKGROOT)$(LIBDIR)" \
-	         "$(PKGROOT)$(SYSCONFDIR)"
+	         "$(PKGROOT)$(SYSCONFDIR)" \
+			 "$(PKGROOT)/bin"
 	install -m0755 "$(DISPATCHER)" "$(PKGROOT)$(BINDIR)/mc"
 	install -m0755 "$(WRAPPER)"    "$(PKGROOT)/bin/mc"
 	install -m0755 $(COMMANDS)     "$(PKGROOT)$(CMDDIR)/"
