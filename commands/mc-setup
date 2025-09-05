@@ -300,7 +300,7 @@ unset MCPASS
 if [[ $EDITION == "Java" ]]; then
   info "Installing Java (official Mojang vanilla) and server jar (as mcadmin)…"
   pct exec "$CTID" -- env MC_VER="$VERSION" bash -lc '
-  set -euo pipefail
+  set -eE -o pipefail
   apt-get update
   apt-get install -y openjdk-21-jre-headless curl jq screen
   install -d -o mcadmin -g mcadmin /opt/minecraft
