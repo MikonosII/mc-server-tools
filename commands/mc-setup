@@ -90,6 +90,53 @@ while [[ ${1:-} == --* ]]; do
   esac
 done
 
+# --- IPv4 helpers ---
+ip_to_int(){ IFS=. read -r a b c d <<<"$1"; echo $(( (a<<24) | (b<<16) | (c<<8) | d )); }
+int_to_ip(){ local n=$1; printf '%d.%d.%d.%d' $(((n>>24)&255)) $(((n>>16)&255)) $(((n>>8)&255)) $((n&255)); }
+mask_from_prefix(){ local p=$1; echo $(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF )); }
+network_of(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_from_prefix "$p"); int_to_ip $(( ipi & m )); }
+first_host(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_from_prefix "$p"); int_to_ip $(( (ipi & m) + 1 )); }
+broadcast_of(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_from_prefix "$p"); local b=$(( (ipi & m) | ((1 << (32-p)) - 1) )); int_to_ip "$b"; }
+
+# Extract ip= value from a CT's net0, if present
+ct_ip(){
+  local id=$1
+  pct config "$id" 2>/dev/null | awk -F'[=, ]' '/^net0:/{for(i=1;i<=NF;i++) if($i=="ip"){print $(i+1)}}'
+}
+
+# Is IP already in use by any LXC config we manage?
+ip_used_by_cts(){
+  local ip=$1
+  # robust: no process substitution required
+  pct list | awk 'NR>1{print $1}' | while read -r id; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    local nip; nip=$(ct_ip "$id")
+    if [[ "$nip" == "$ip"/* ]]; then
+      echo yes; break
+    fi
+  done | grep -q .
+}
+
+# Next free host IP starting from SEED in that subnet (skips network & broadcast)
+next_free_ip(){ # $1=seed_ip $2=prefix
+  local seed=$1 pfx=$2
+  local bcast; bcast=$(broadcast_of "$seed" "$pfx")
+  local cur_int=$(( $(ip_to_int "$seed") ))
+  local bcast_int=$(( $(ip_to_int "$bcast") ))
+  local first; first=$(first_host "$seed" "$pfx")
+  local first_int=$(( $(ip_to_int "$first") ))
+  (( cur_int < first_int )) && cur_int=$first_int
+  while (( cur_int < bcast_int )); do
+    local candidate; candidate=$(int_to_ip "$cur_int")
+    if ! ip_used_by_cts "$candidate"; then
+      echo "$candidate"; return 0
+    fi
+    ((cur_int++))
+  done
+  return 1
+}
+
+
 # ----- Static IPv4 assignment -----
 if [[ "${EDITION:-Java}" == "Java" ]]; then
   IPV4_SEED="${NET_JAVA_START}"; IPV4_PFX="${NET_JAVA_PREFIX:-24}"
