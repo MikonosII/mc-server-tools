@@ -1,16 +1,103 @@
 #!/usr/bin/env bash
+# /usr/bin/mc-stop
+# Stop a Minecraft server running inside a Proxmox LXC (Java or Bedrock).
+# Usage: mc-stop <CTID>
 set -euo pipefail
 
+# Try shared helpers if present
+if [[ -f /usr/share/mc-server-tools/lib/common.sh ]]; then
+  . /usr/share/mc-server-tools/lib/common.sh
+else
+  err(){ echo "ERROR: $*" >&2; }
+  warn(){ echo "WARN:  $*" >&2; }
+  info(){ echo "-- $*"; }
+  require_root(){ [[ $EUID -eq 0 ]] || { err "Run as root"; exit 1; }; }
+fi
 
-CTID=${1:?"Usage: mc stop <CTID>"}
+STOP_TIMEOUT="${STOP_TIMEOUT:-30}"   # seconds to wait for graceful stop
 
+usage(){ echo "Usage: $(basename "$0") <CTID>"; }
 
-# Attempt to gracefully stop Minecraft service inside the CT first
-pct exec "$CTID" -- systemctl stop minecraft.service 2>/dev/null || true
+ct_exists(){ pct config "$1" >/dev/null 2>&1; }
+ct_status(){ pct status "$1" 2>/dev/null | awk '{print $2}'; }  # running|stopped
+ct_running(){ [[ "$(ct_status "$1")" == "running" ]]; }
 
+screen_present(){
+  pct exec "$1" -- bash -lc 'screen -ls 2>/dev/null | grep -q "\.mc"' >/dev/null
+}
 
-# Then stop the container itself
-pct stop "$CTID"
+service_active(){
+  pct exec "$1" -- systemctl is-active --quiet minecraft.service
+}
 
+send_stop(){
+  pct exec "$1" -- bash -lc '/usr/bin/screen -S mc -p 0 -X stuff "stop^M"' || true
+}
 
-echo "CT $CTID stopped"
+wait_screen_gone(){
+  local id=$1; local timeout=${2:-30}; local i=0
+  while (( i < timeout )); do
+    if ! screen_present "$id"; then return 0; fi
+    sleep 1; ((i++))
+  done
+  return 1
+}
+
+wait_service_stopped(){
+  local id=$1; local timeout=${2:-30}; local i=0
+  while (( i < timeout )); do
+    if ! service_active "$id"; then return 0; fi
+    sleep 1; ((i++))
+  done
+  return 1
+}
+
+main(){
+  local id=${1:-}
+  [[ -n "$id" ]] || { usage; exit 1; }
+  require_root
+  ct_exists "$id" || { err "CTID $id not found"; exit 1; }
+
+  if ! ct_running "$id"; then
+    info "CT $id is not running; nothing to stop."
+    exit 0
+  fi
+
+  # Prefer graceful stop via screen "stop"
+  if screen_present "$id"; then
+    info "Sending 'stop' to screen session in CT $id..."
+    send_stop "$id"
+    if wait_screen_gone "$id" "$STOP_TIMEOUT"; then
+      info "Stopped cleanly (screen session ended)."
+      exit 0
+    else
+      warn "Screen still present after ${STOP_TIMEOUT}s; asking systemd to stop."
+    fi
+  else
+    info "No screen session detected; asking systemd to stop if active."
+  fi
+
+  # Ask systemd to stop (works for both Java/Bedrock services installed by mc-setup)
+  if service_active "$id"; then
+    pct exec "$id" -- systemctl stop minecraft.service || true
+    if wait_service_stopped "$id" "$STOP_TIMEOUT"; then
+      info "minecraft.service stopped."
+      exit 0
+    else
+      warn "Service still active after ${STOP_TIMEOUT}s."
+    fi
+  fi
+
+  # Last-resort clean-up: try to close any lingering screen named 'mc'
+  info "Attempting to close lingering screen session..."
+  pct exec "$id" -- bash -lc 'screen -S mc -X quit || true'
+  if wait_screen_gone "$id" 5; then
+    info "Screen quit."
+    exit 0
+  fi
+
+  err "Failed to stop server gracefully. Inspect CT $id: 'pct enter $id' and check processes."
+  exit 1
+}
+
+main "$@"
