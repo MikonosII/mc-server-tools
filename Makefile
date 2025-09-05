@@ -12,7 +12,23 @@ SYSCONFDIR    := /etc/mc-server-tools
 
 PKG           := mc-server-tools
 ARCH          := all
-VERSION       ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo 0.1.0)
+# Version logic:
+# - On a tag like v1.2.3-4-gABCDEF:  ->  1.2.3+git4.ABCDEF
+# - On exact tag v1.2.3:             ->  1.2.3
+# - No tags:                          ->  0.0.0+gitYYYYMMDD.SHA
+VERSION ?= $(shell sh -c '\
+  set -e; \
+  D=$$(git describe --tags --match "v[0-9]*" --abbrev=7 --dirty 2>/dev/null || true); \
+  if echo "$$D" | grep -Eq "^v[0-9]"; then \
+    echo "$$D" \
+      | sed -E "s/^v//" \
+      | sed -E "s/-([0-9]+)-g([0-9a-f]+)/+git\1.\2/" \
+      | sed -E "s/-dirty/+dirty/"; \
+  else \
+    S=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown); \
+    echo "0.0.0+git$$(date -u +%Y%m%d).$$S"; \
+  fi')
+
 
 # Staging for the deb
 PKGROOT       := build/pkgroot
