@@ -195,6 +195,11 @@ fi
 # Hostname
 if [[ -z "$HN" ]]; then read -r -p "Hostname [mc-$CTID]: " HN; HN=${HN:-mc-$CTID}; fi
 
+# right before you call mc-select-template
+[[ -x /usr/share/mc-server-tools/commands/mc-select-template ]] \
+  || { err "mc-select-template helper not found (expected at /usr/share/mc-server-tools/commands/mc-select-template)"; exit 1; }
+
+
 # --- Template selection via helper (no default unless saved & valid) ---
 TEMPLATE="$(
   /usr/bin/env bash /usr/share/mc-server-tools/commands/mc-select-template \
@@ -202,6 +207,8 @@ TEMPLATE="$(
     --default  "${DEFAULT_TEMPLATE:-}"
 )"
 set_config_var DEFAULT_TEMPLATE "$TEMPLATE"
+
+[[ "$TEMPLATE" =~ :vztmpl/ ]] || { err "Template must look like storage:vztmpl/<file>, got: $TEMPLATE"; exit 1; }
 
 # RootFS storage (prefer local-lvm, else local)
 STOR=$(pvesm status 2>/dev/null | awk 'NR>1 && $1=="local-lvm"{print $1}' | head -n1)
