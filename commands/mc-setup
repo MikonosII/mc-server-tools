@@ -45,6 +45,9 @@ set_config_var() { # $1=KEY $2=VALUE
 }
 
 validate_numeric() { [[ "$1" =~ ^[0-9]+$ ]]; }
+# Validate "HHMM" (24h)
+validate_hhmm(){ [[ "$1" =~ ^([01][0-9]|2[0-3])[0-5][0-9]$ ]]; }
+
 
 # --- IPv4 helpers ---
 ip_to_int(){ IFS=. read -r a b c d <<<"$1"; echo $(( (a<<24) | (b<<16) | (c<<8) | d )); }
@@ -132,7 +135,17 @@ echo "=== Minecraft Server Setup ==="
 
 # ----- Simple helpers -----
 ctid_exists(){ pct config "$1" >/dev/null 2>&1; }
-port_in_use_host(){ ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
+ port_in_use_host(){
+   local port="$1"
+   if command -v ss >/dev/null 2>&1; then
+     ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"
+   elif command -v netstat >/dev/null 2>&1; then
+     netstat -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"
+   else
+     warn "Neither ss nor netstat found; skipping host port check for ${port}"
+     return 1
+   fi
+ }
 seed_port(){ [[ ${1:-Java} == Bedrock ]] && echo 19132 || echo 25565; }
 
 next_free_ctid_port() {
@@ -280,7 +293,8 @@ chmod +x /usr/local/bin/mc-start'
   pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service << "EOF"
 [Unit]
 Description=Minecraft Server (Vanilla)
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=forking
@@ -293,7 +307,8 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable minecraft.service'
+systemctl enable minecraft.service
+systemctl start minecraft.service'
 
 else
   info "Setting up Bedrock (as mcadmin)"
@@ -340,7 +355,8 @@ TimeoutStopSec=30s
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable minecraft.service'
+systemctl enable minecraft.service
+systemctl start minecraft.service'
 fi
 
 # --- Backups via host cron (vzdump) ---
