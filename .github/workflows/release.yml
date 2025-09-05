@@ -35,11 +35,8 @@ jobs:
           body: |
             ## Install with wget + apt
             ```bash
-            TAG="${{ github.ref_name }}"
-            REPO="${{ github.repository }}"
-            ASSET="${{ steps.deb.outputs.url_file }}"
-            wget -q "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+            wget -q "https://github.com/${REPO}/releases/download/${{ github.ref_name }}/${{ steps.deb.outputs.url_file }}"
             apt-get update
-            apt-get install -y "./${ASSET}"
+            apt-get install -y "./${{ steps.deb.outputs.url_file }}"
             mc --help
             ```
