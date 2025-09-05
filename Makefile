@@ -50,7 +50,7 @@ Priority: optional
 Architecture: all
 Maintainer: $(MAINTAINER)
 Depends: bash, curl, jq, lxc | proxmox-ve
-Description: Minecraft server tools for Proxmox LXC Utilities and scripts to create and manage Minecraft servers in LXC.
+Description: Minecraft server tools for Proxmox LXC Utilities and scripts to create and manage Minecraft servers in LXC
 EOF
 	dpkg-deb --build $(PKGROOT) ../mc-server-tools_$(VERSION)_all.deb
 	@echo "==> Built ../mc-server-tools_$(VERSION)_all.deb"
