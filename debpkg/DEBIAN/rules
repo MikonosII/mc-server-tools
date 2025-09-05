@@ -1,0 +1,6 @@
+#!/usr/bin/make -f
+# Minimal dh(13) rules
+export DH_VERBOSE = 1
+
+%:
+	dh $@
