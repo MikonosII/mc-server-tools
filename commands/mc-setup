@@ -90,14 +90,6 @@ while [[ ${1:-} == --* ]]; do
   esac
 done
 
-# --- IPv4 helpers ---
-ip_to_int(){ IFS=. read -r a b c d <<<"$1"; echo $(( (a<<24) | (b<<16) | (c<<8) | d )); }
-int_to_ip(){ local n=$1; printf '%d.%d.%d.%d' $(((n>>24)&255)) $(((n>>16)&255)) $(((n>>8)&255)) $((n&255)); }
-mask_from_prefix(){ local p=$1; echo $(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF )); }
-network_of(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_from_prefix "$p"); int_to_ip $(( ipi & m )); }
-first_host(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_from_prefix "$p"); int_to_ip $(( (ipi & m) + 1 )); }
-broadcast_of(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_from_prefix "$p"); local b=$(( (ipi & m) | ((1 << (32-p)) - 1) )); int_to_ip "$b"; }
-
 # Extract ip= value from a CT's net0, if present
 ct_ip(){
   local id=$1
@@ -284,7 +276,8 @@ if [[ $EDITION == "Java" ]]; then
   '
 
   info "Creating start script and service (runs as mcadmin)..."
-  pct exec "$CTID" -- env MEM="$MEM" bash -lc 'cat >/usr/local/bin/mc-start << "EOS"
+  # Bake MEM into the script at creation time
+  pct exec "$CTID" -- env MEM="$MEM" bash -lc 'cat >/usr/local/bin/mc-start << EOF
 #!/usr/bin/env bash
 set -e
 cd /opt/minecraft
