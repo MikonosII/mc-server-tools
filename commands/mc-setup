@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
 # mc-setup — create and configure a Minecraft server LXC on Proxmox (screen-based)
-# - Java: installs official Mojang vanilla server.jar
-# - Networking: static IPv4, gateway test
-# - CTID policy: CTID == server port (Java 25565+)
-# - Templates: uses mc-select-template helper
-# - Preflight: hardens apt, IPv4 preference; runs inside CT
-# - Service: systemd unit launching under screen session "minecraft"
-
 set -euo pipefail
 
 # --- Common / config ---
@@ -14,21 +7,19 @@ if [ -f /usr/share/mc-server-tools/lib/common.sh ]; then
   # shellcheck disable=SC1091
   . /usr/share/mc-server-tools/lib/common.sh
 else
-  # minimal fallbacks
   log()  { printf "%s\n" "$*"; }
   info() { printf "[INFO] %s\n" "$*"; }
   warn() { printf "[WARN] %s\n" "$*" >&2; }
   err()  { printf "[ERROR] %s\n" "$*" >&2; }
-  require_root() { [ "$(id -u)" -eq 0 ] || { err "must be root"; exit 1; }; }
+  require_root(){ [ "$(id -u)" -eq 0 ] || { err "Run as root (sudo -i)"; exit 1; }; }
 fi
+require_root
 
-# Host-side wrappers that execute preflight inside CT
+# host-side preflight wrappers (run work inside CT)
 if [ -f /usr/share/mc-server-tools/lib/preflight.sh ]; then
   # shellcheck disable=SC1091
   . /usr/share/mc-server-tools/lib/preflight.sh
 fi
-
-require_root
 
 CONFIG_FILE="/etc/mc-server-tools/config"
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
@@ -43,14 +34,8 @@ DISK_DEFAULT="${DISK_DEFAULT:-16G}"
 BRIDGE="${BRIDGE:-vmbr0}"
 STORAGE="${STORAGE:-local-lvm}"
 
-# --- Prompt helper ---
-ask() {
-  local prompt="$1" def="${2:-}" var
-  read -r -p "$prompt${def:+ [$def]}: " var || true
-  echo "${var:-$def}"
-}
+ask() { local p="$1" d="${2:-}"; local v; read -r -p "$p${d:+ [$d]}: " v || true; echo "${v:-$d}"; }
 
-# --- Pick edition / version / sizing ---
 echo "=== Minecraft Server Setup ==="
 EDITION="$(ask "Server Edition" "$EDITION_DEFAULT")"
 MC_VER_REQ="$(ask "Minecraft Version" "$MCVER_DEFAULT")"
@@ -58,42 +43,32 @@ MEM_MB="$(ask "Memory (MB)" "$MEM_MB_DEFAULT")"
 CORES="$(ask "CPU cores" "$CORES_DEFAULT")"
 BACKUP_HHMM="$(ask "Daily backup time (HHMM, 24h)" "$BACKUP_HHMM_DEFAULT")"
 
-# --- Port & CTID policy (Java -> 25565 base) ---
-if [[ "${EDITION,,}" == "java" ]]; then
-  PORT_DEFAULT="${PORT_DEFAULT:-25565}"
-else
-  PORT_DEFAULT="${PORT_DEFAULT:-19132}"
-fi
+# Port ↔ CTID policy
+if [[ "${EDITION,,}" == "java" ]]; then PORT_DEFAULT="${PORT_DEFAULT:-25565}"; else PORT_DEFAULT="${PORT_DEFAULT:-19132}"; fi
 PORT="$(ask "Port" "$PORT_DEFAULT")"
 CTID="$PORT"
 
-# --- Networking (simple helper: choose IPv4 + gw) ---
-if type choose_ipv4 >/dev/null 2>&1; then
-  choose_ipv4  # expected to set IP_CIDR and GATEWAY
-fi
+# Network helpers (optional)
+if type choose_ipv4 >/dev/null 2>&1; then choose_ipv4; fi
 IP_CIDR="${IP_CIDR:-$(ask "IPv4 CIDR (e.g. 192.168.205.100/24)" "192.168.205.100/24")}"
 GATEWAY="${GATEWAY:-$(ask "Gateway" "192.168.205.1")}"
 info "Selected IPv4 address: $IP_CIDR"
 info "Gateway: $GATEWAY"
 
-# --- Hostname ---
+# Hostname
 HN_DEFAULT="MC-${EDITION^}-${PORT}"
 HOSTNAME="$(ask "Hostname" "$HN_DEFAULT")"
 
-# --- Template selection ---
+# Template selection
 TEMPLATE=""
 if command -v pveam >/dev/null 2>&1; then
   echo "Installed templates:"
   mapfile -t TEMPLS < <(pveam list local 2>/dev/null | awk '{print $2}' | grep -E '(^|/)((ubuntu|debian).*-standard_.*amd64\.tar\.(zst|xz))$' || true)
-  idx=1
-  for t in "${TEMPLS[@]}"; do
-    echo "$idx. local:vztmpl/${t##*/}"
-    idx=$((idx+1))
-  done
+  i=1; for t in "${TEMPLS[@]}"; do echo "$i. local:vztmpl/${t##*/}"; i=$((i+1)); done
   DEF_INDEX="${DEF_INDEX:-${#TEMPLS[@]}}"
   read -r -p "Choose template [${DEF_INDEX:-1}] or 'd' to download: " choice || true
-  if [[ "$choice" == "d" || "$choice" == "D" ]]; then
-    if command -v /usr/share/mc-server-tools/commands/mc-select-template >/dev/null 2>&1; then
+  if [[ "$choice" == [dD] ]]; then
+    if [ -x /usr/share/mc-server-tools/commands/mc-select-template ]; then
       TEMPLATE="$(/usr/share/mc-server-tools/commands/mc-select-template)"
     else
       TEMPLATE="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
@@ -105,22 +80,13 @@ if command -v pveam >/dev/null 2>&1; then
     TEMPLATE="local:vztmpl/${TEMPLS[$((sel-1))]##*/}"
   fi
 else
-  # fallback to helper
-  if [ -x /usr/share/mc-server-tools/commands/mc-select-template ]; then
-    TEMPLATE="$(
-      /usr/share/mc-server-tools/commands/mc-select-template
-    )"
-    case "$TEMPLATE" in
-      local:*) : ;;
-      *) TEMPLATE="local:vztmpl/$TEMPLATE" ;;
-    esac
-  else
-    err "mc-select-template helper not found (expected at /usr/share/mc-server-tools/commands/mc-select-template)"
-    exit 1
-  fi
+  [ -x /usr/share/mc-server-tools/commands/mc-select-template ] || { err "mc-select-template helper not found"; exit 1; }
+  TEMPLATE="$(
+    /usr/share/mc-server-tools/commands/mc-select-template
+  )"
+  case "$TEMPLATE" in local:*) :;; *) TEMPLATE="local:vztmpl/$TEMPLATE";; esac
 fi
 
-# --- Summary ---
 cat <<EOF
 [INFO] Summary
 CTID:      $CTID
@@ -137,27 +103,24 @@ Autostart: Yes (always)
 Backups:   Daily @ $(printf '%02d:%02d' "${BACKUP_HHMM:0:2}" "${BACKUP_HHMM:2:2}")
 EOF
 
-# --- Ask for mcadmin password ---
+# mcadmin password
 read -r -s -p "Enter password for mcadmin: " MCPASS; echo
 read -r -s -p "Confirm password for mcadmin: " MCPASS2; echo
 [ "$MCPASS" = "$MCPASS2" ] || { err "Passwords do not match"; exit 1; }
 
-# --- Create the container ---
+# Create CT
 info "Creating container CT $CTID..."
 pct create "$CTID" "$TEMPLATE" \
   -rootfs "$STORAGE:$DISK_DEFAULT" \
   -hostname "$HOSTNAME" \
   -net0 "name=eth0,bridge=$BRIDGE,ip=$IP_CIDR,gw=$GATEWAY" \
-  -onboot 1 \
-  -memory "$MEM_MB" \
-  -cores "$CORES" \
-  -features "nesting=1" \
-  -unprivileged 1
+  -onboot 1 -memory "$MEM_MB" -cores "$CORES" \
+  -features "nesting=1" -unprivileged 1
 
 info "Starting CT $CTID..."
 pct start "$CTID"
 
-# Quick gateway check from inside the CT
+# Gateway check
 info "Checking gateway $GATEWAY from inside CT $CTID..."
 if pct exec "$CTID" -- bash -lc "timeout 3 ping -c1 -W1 $GATEWAY >/dev/null 2>&1"; then
   info "Gateway $GATEWAY is reachable from inside CT $CTID"
@@ -165,12 +128,11 @@ else
   warn "Gateway $GATEWAY not reachable (continuing)"
 fi
 
-# --- Preflight inside CT ---
+# Preflight inside CT
 info "[mc-setup] Running preflight networking/apt hardening…"
 if type preflight_net_apt >/dev/null 2>&1; then
   preflight_net_apt "$CTID"
 else
-  # inline fallback (rare)
   pct exec "$CTID" -- bash -s <<'CTSCRIPT'
 set -eE -o pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -186,7 +148,7 @@ apt-get update -y
 CTSCRIPT
 fi
 
-# --- Create mcadmin and set password ---
+# Create mcadmin
 info "[mc-setup] Creating mcadmin with provided password…"
 if type preflight_create_mcadmin >/dev/null 2>&1; then
   preflight_create_mcadmin "$CTID" "$MCPASS"
@@ -200,19 +162,16 @@ else
 fi
 unset MCPASS MCPASS2
 
-# --- Install Java + server.jar (honors MC_VER via env) ---
-info "[mc-setup] Installing Java (official Mojang vanilla) and server jar (as mcadmin)…"
+# Java + server.jar (honors MC_VER from host env)
+info "[mc-setup] Installing Java (vanilla) and server.jar (as mcadmin)…"
 pct exec "$CTID" -- env MC_VER="${MC_VER_REQ:-}" bash -s <<'CTSCRIPT'
 set -eE -o pipefail
 export DEBIAN_FRONTEND=noninteractive
-
 apt-get update -y
 apt-get install -y openjdk-21-jre-headless curl jq screen
-
 id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin || true
 install -d -o mcadmin -g mcadmin /opt/minecraft
 cd /opt/minecraft
-
 REQ_VERSION="${MC_VER:-Latest}"
 MJSON="$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json)"
 LOWER="$(printf '%s' "$REQ_VERSION" | tr "[:upper:]" "[:lower:]")"
@@ -228,19 +187,17 @@ chown mcadmin:mcadmin server.jar
 echo "[mc] Downloaded server.jar for $REQ_VERSION"
 CTSCRIPT
 
-# --- Start script + screen-based systemd unit ---
-info "[mc-setup] Creating start script and service (runs under screen as mcadmin)…"
+# Start script + screen-based unit (session name = mc)
+info "[mc-setup] Creating start script and service (screen: mc)…"
 pct exec "$CTID" -- bash -s <<'CTSCRIPT'
 set -eE -o pipefail
 
-# Defaults
 cat >/etc/default/minecraft <<EOF
 MEM_MIN=1G
 MEM_MAX=4G
 EULA_ACCEPT=true
 EOF
 
-# Start script
 cat >/opt/minecraft/start.sh <<'EOF'
 #!/usr/bin/env bash
 set -eE -o pipefail
@@ -262,7 +219,6 @@ EOF
 chmod +x /opt/minecraft/start.sh
 chown mcadmin:mcadmin /opt/minecraft/start.sh
 
-# Unit (screen-based)
 install -d -o mcadmin -g mcadmin /var/log/minecraft
 cat >/etc/systemd/system/minecraft.service <<'EOF'
 [Unit]
@@ -278,8 +234,8 @@ Group=mcadmin
 WorkingDirectory=/opt/minecraft
 EnvironmentFile=-/etc/default/minecraft
 ExecStartPre=/usr/bin/install -d -o mcadmin -g mcadmin /var/log/minecraft
-ExecStart=/usr/bin/screen -DmS minecraft -L -Logfile /var/log/minecraft/screen.log /opt/minecraft/start.sh
-ExecStop=/usr/bin/screen -S minecraft -X stuff "stop\015"
+ExecStart=/usr/bin/screen -DmS mc -L -Logfile /var/log/minecraft/screen.log /opt/minecraft/start.sh
+ExecStop=/usr/bin/screen -S mc -X stuff "stop\015"
 TimeoutStopSec=120
 KillMode=mixed
 Restart=on-failure
@@ -288,7 +244,6 @@ StandardOutput=journal
 StandardError=journal
 Nice=10
 LimitNOFILE=1048576
-
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
@@ -305,18 +260,16 @@ systemctl enable minecraft
 systemctl restart minecraft || true
 CTSCRIPT
 
-# --- Final output / tips ---
 cat <<EOF
 [OK] CT $CTID created and minecraft.service started.
 
 Attach console:
-  mc attach $CTID
-  # detach with: Ctrl+A then D
+  mc console $CTID      # or: mc attach $CTID
 
-Send a one-off command:
+Send command:
   mc send $CTID "list"
   mc send $CTID "save-all"
 
-Tail server log:
+Tail screen log:
   pct exec $CTID -- bash -lc 'tail -F /var/log/minecraft/screen.log'
 EOF
