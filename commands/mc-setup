@@ -261,6 +261,7 @@ if [[ $EDITION == "Java" ]]; then
     apt-get update
     apt-get install -y openjdk-21-jre-headless curl jq screen
     id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
+    echo "mcadmin:changeme" | chpasswd
     install -d -o mcadmin -g mcadmin /opt/minecraft
     cd /opt/minecraft
     VER="${MC_VER:-Latest}"
