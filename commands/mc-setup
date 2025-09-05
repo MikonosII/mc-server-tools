@@ -90,45 +90,6 @@ while [[ ${1:-} == --* ]]; do
   esac
 done
 
-# Extract ip= value from a CT's net0, if present
-ct_ip(){
-  local id=$1
-  pct config "$id" 2>/dev/null | awk -F'[=, ]' '/^net0:/{for(i=1;i<=NF;i++) if($i=="ip"){print $(i+1)}}'
-}
-
-# Is IP already in use by any LXC config we manage?
-ip_used_by_cts(){
-  local ip=$1
-  # robust: no process substitution required
-  pct list | awk 'NR>1{print $1}' | while read -r id; do
-    [[ "$id" =~ ^[0-9]+$ ]] || continue
-    local nip; nip=$(ct_ip "$id")
-    if [[ "$nip" == "$ip"/* ]]; then
-      echo yes; break
-    fi
-  done | grep -q .
-}
-
-# Next free host IP starting from SEED in that subnet (skips network & broadcast)
-next_free_ip(){ # $1=seed_ip $2=prefix
-  local seed=$1 pfx=$2
-  local bcast; bcast=$(broadcast_of "$seed" "$pfx")
-  local cur_int=$(( $(ip_to_int "$seed") ))
-  local bcast_int=$(( $(ip_to_int "$bcast") ))
-  local first; first=$(first_host "$seed" "$pfx")
-  local first_int=$(( $(ip_to_int "$first") ))
-  (( cur_int < first_int )) && cur_int=$first_int
-  while (( cur_int < bcast_int )); do
-    local candidate; candidate=$(int_to_ip "$cur_int")
-    if ! ip_used_by_cts "$candidate"; then
-      echo "$candidate"; return 0
-    fi
-    ((cur_int++))
-  done
-  return 1
-}
-
-
 # ----- Static IPv4 assignment -----
 if [[ "${EDITION:-Java}" == "Java" ]]; then
   IPV4_SEED="${NET_JAVA_START}"; IPV4_PFX="${NET_JAVA_PREFIX:-24}"
@@ -276,15 +237,16 @@ if [[ $EDITION == "Java" ]]; then
   '
 
   info "Creating start script and service (runs as mcadmin)..."
-  # Bake MEM into the script at creation time
-  pct exec "$CTID" -- env MEM="$MEM" bash -lc 'cat >/usr/local/bin/mc-start << EOF
+ # Bake MEM into the script at creation time
+pct exec "$CTID" -- env MEM="$MEM" bash -lc 'cat >/usr/local/bin/mc-start << EOF
 #!/usr/bin/env bash
 set -e
 cd /opt/minecraft
 # keep session name "mc" for tooling compatibility
 su -s /bin/bash - mcadmin -c "screen -dmS mc java -Xms512M -Xmx${MEM}M -jar server.jar nogui"
-EOS
+EOF
 chmod +x /usr/local/bin/mc-start'
+
 
   pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service << "EOF"
 [Unit]
