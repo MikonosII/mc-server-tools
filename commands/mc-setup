@@ -105,11 +105,14 @@ next_free_ip() { # $1=seed_ip $2=prefix
 
 # Template persistence & discovery
 installed_templates() {
-  local storages; storages=$(pvesm status 2>/dev/null | awk '$2=="dir"{print $1}')
-  local s
+  # List installed LXC templates across all storages; output: <storage>:vztmpl/<file>
+  local storages s
+  storages=$(pvesm status 2>/dev/null | awk 'NR>1{print $1}')
   for s in $storages; do
-    pveam list "$s" 2>/dev/null | awk -v S="$s" 'NR>1 && $2!="" {printf "%s:vztmpl/%s
-", S, $2}'
+    pveam list "$s" 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' | while read -r t; do
+      printf '%s:vztmpl/%s
+' "$s" "$t"
+    done
   done
 }
 
