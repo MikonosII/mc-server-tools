@@ -1,53 +1,136 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# mc — dispatcher for mc-server-tools
-# Commands live in: /usr/share/mc-server-tools/commands
+# Try to use your shared helpers, but fall back if missing.
+if [[ -f /usr/share/mc-server-tools/lib/common.sh ]]; then
+  . /usr/share/mc-server-tools/lib/common.sh
+else
+  err(){ echo "ERROR: $*" >&2; }
+  warn(){ echo "WARN: $*" >&2; }
+  info(){ echo "-- $*"; }
+  require_root(){ [[ $EUID -eq 0 ]] || { err "This command must be run as root"; exit 1; }; }
+fi
 
-CMDDIR="${MC_CMDDIR:-/usr/share/mc-server-tools/commands}"
-PROG="mc"
+require_root
 
-show_help() {
-  cat <<'EOF'
-mc <command> [options]
+usage() {
+  cat <<EOF
+Usage:
+  mc list
+  mc status <CTID>
+  mc start  <CTID>
+  mc stop   <CTID>
+  mc restart <CTID>
+  mc logs   <CTID> [LINES=200]
+  mc backup <CTID>   # vzdump snapshot with zstd
 
-Commands:
-  setup       Create a new Minecraft server CT
-  start       Start a server (mc start <CTID>)
-  stop        Stop a server (mc stop <CTID>)
-  restart     Restart a server (mc restart <CTID>)
-  console     Attach to a server console (mc console <CTID>)
-  logs        Show server logs (mc logs <CTID>)
-  backup      Run a manual backup (mc backup <CTID>)
-  list        List Minecraft servers
-  copy        Create a new CT by copying worlds from an existing one
-  new         Archive the current world and generate a fresh one (mc new <CTID> [--seed SEED])
-  help        Show this help message
-
-Environment:
-  MC_CMDDIR   Override the commands directory (default: /usr/share/mc-server-tools/commands)
+Notes:
+  - Works for both Java and Bedrock because both use a screen session named "mc".
+  - "logs" reads the minecraft.service journal inside the CT.
 EOF
 }
 
-COMMAND="${1:-}"
-if [[ -z "${COMMAND}" || "${COMMAND}" == "-h" || "${COMMAND}" == "--help" || "${COMMAND}" == "help" ]]; then
-  show_help
-  exit 0
-fi
-shift || true
+ct_exists(){ pct config "$1" >/dev/null 2>&1; }
+ct_status(){ pct status "$1" 2>/dev/null | awk '{print $2}'; }  # running|stopped
+ct_running(){ [[ "$(ct_status "$1")" == "running" ]]; }
 
-case "${COMMAND}" in
-  setup|start|stop|restart|console|logs|backup|list|copy|new)
-    CMDPATH="${CMDDIR}/mc-${COMMAND}"
-    if [[ ! -x "${CMDPATH}" ]]; then
-      echo "Error: command '${COMMAND}' not found at ${CMDPATH}" >&2
-      exit 127
+screen_present() {
+  # returns 0 if 'mc' screen session exists inside CT
+  pct exec "$1" -- bash -lc 'screen -ls 2>/dev/null | grep -q "\.mc"' >/dev/null
+}
+
+send_stop() {
+  # send "stop<Enter>" to the screen session inside CT
+  pct exec "$1" -- bash -lc '/usr/bin/screen -S mc -p 0 -X stuff "stop^M"' || true
+}
+
+wait_screen_gone() {
+  local id=$1 timeout=${2:-30}
+  local i=0
+  while (( i < timeout )); do
+    if ! screen_present "$id"; then return 0; fi
+    sleep 1; ((i++))
+  done
+  return 1
+}
+
+case "${1:-}" in
+  list)
+    pct list
+    ;;
+
+  status)
+    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
+    ct_exists "$id" || { err "CTID $id not found"; exit 1; }
+    s=$(ct_status "$id" || true)
+    echo "CT $id: ${s:-unknown}"
+    if ct_running "$id"; then
+      if screen_present "$id"; then
+        echo "  screen: mc (present)"
+      else
+        echo "  screen: not found"
+      fi
+      if pct exec "$id" -- systemctl is-active --quiet minecraft.service; then
+        echo "  service: active"
+      else
+        echo "  service: inactive"
+      fi
     fi
-    exec "${CMDPATH}" "$@"
     ;;
+
+  start)
+    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
+    ct_exists "$id" || { err "CTID $id not found"; exit 1; }
+    ct_running "$id" || { info "Starting CT $id"; pct start "$id"; }
+    info "Starting minecraft.service in CT $id"
+    pct exec "$id" -- systemctl start minecraft.service
+    ;;
+
+  stop)
+    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
+    ct_exists "$id" || { err "CTID $id not found"; exit 1; }
+    ct_running "$id" || { info "CT $id is not running"; exit 0; }
+
+    if screen_present "$id"; then
+      info "Sending 'stop' to screen session in CT $id"
+      send_stop "$id"
+      if wait_screen_gone "$id" 30; then
+        info "Screen session ended cleanly."
+      else
+        warn "Screen still present after 30s; asking systemd to stop."
+        pct exec "$id" -- systemctl stop minecraft.service || true
+        # Last resort: kill any leftover screen named mc (should be rare)
+        pct exec "$id" -- bash -lc 'pkill -f "SCREEN.*\\bmc\\b" || true'
+      fi
+    else
+      info "No screen session found; stopping service if running."
+      pct exec "$id" -- systemctl stop minecraft.service || true
+    fi
+    ;;
+
+  restart)
+    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
+    "$0" stop "$id" || true
+    "$0" start "$id"
+    ;;
+
+  logs)
+    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
+    lines=${3:-200}
+    ct_running "$id" || { err "CT $id not running"; exit 1; }
+    pct exec "$id" -- journalctl -u minecraft.service --no-pager -n "$lines"
+    ;;
+
+  backup)
+    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
+    info "Starting vzdump snapshot backup of CT $id"
+    vzdump "$id" --mode snapshot --compress zstd
+    ;;
+
+  ""|-h|--help|help)
+    usage
+    ;;
+
   *)
-    echo "Unknown command: ${COMMAND}" >&2
-    echo "Run 'mc help' for usage." >&2
-    exit 1
-    ;;
+    usage; exit 1;;
 esac
