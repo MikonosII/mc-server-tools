@@ -3,8 +3,6 @@ set -euo pipefail
 
 . /usr/share/mc-server-tools/lib/common.sh
 require_root
-# Default disk size
-DISK_GB=${DISK_GB:-16G}
 # Load networking config (create defaults if missing)
 CONFIG_FILE="/etc/mc-server-tools/config"
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -22,6 +20,9 @@ EOF
 fi
 # shellcheck disable=SC1090
 . "$CONFIG_FILE"
+
+# Default disk size in GiB for pct create (integer, no G suffix)
+: "${DISK_GB:=16}"
 
 # ----- IP math helpers -----
 ip_to_int() { # $1=IPv4
