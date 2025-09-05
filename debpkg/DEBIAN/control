@@ -1,13 +1,15 @@
-Package: mc-server-tools
-Version: @VERSION@
+Source: mc-server-tools
 Section: admin
 Priority: optional
-Architecture: all
 Maintainer: Your Name <you@example.com>
-Depends: bash, coreutils, grep, gawk, sed, iproute2, cron, screen, curl, unzip
-Recommends: pve-container, pve-manager
-Suggests: openjdk-21-jre-headless
-Description: Minecraft server tools for Proxmox LXC (Java & Bedrock)
- Streamlined helper commands to create, copy, manage, and back up Minecraft servers
- in Proxmox LXC containers. Bridge-only networking, static IPs, thin-provisioned disks,
- daily backups (vzdump), CTID=Port policy, and auto-detected Java/Bedrock installs.
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/yourorg/mc-server-tools
+Rules-Requires-Root: no
+
+Package: mc-server-tools
+Architecture: all
+Depends: ${misc:Depends}, bash, lxc | proxmox-ve, curl, jq
+Description: Minecraft server tools for Proxmox LXC
+ Utilities and scripts to create and manage Minecraft servers in LXC.
+ Includes preflight hardening, setup helpers, and convenience commands.
