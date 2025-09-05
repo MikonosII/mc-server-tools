@@ -32,7 +32,7 @@ else
 endif
 
 # --- Inputs ---
-DISPATCHER    := mc
+DISPATCHER    := mc-server-tools/usr/bin/mc
 COMMANDS      := commands/mc-setup commands/mc-preflight
 LIBS          := lib/common.sh lib/preflight.sh
 CONF_DEFAULT  := debpkg/etc/config
