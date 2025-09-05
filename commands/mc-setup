@@ -90,4 +90,223 @@ while [[ ${1:-} == --* ]]; do
   esac
 done
 
-# ----- Stat
+# ----- Static IPv4 assignment -----
+if [[ "${EDITION:-Java}" == "Java" ]]; then
+  IPV4_SEED="${NET_JAVA_START}"; IPV4_PFX="${NET_JAVA_PREFIX:-24}"
+  if [[ "${NET_JAVA_GW:-auto}" == "auto" || -z "${NET_JAVA_GW:-}" ]]; then
+    IPV4_GW="$(first_host "$IPV4_SEED" "$IPV4_PFX")"
+    [[ "$IPV4_PFX" == "24" ]] && IPV4_GW="$(echo "$IPV4_SEED" | awk -F. '{printf "%d.%d.%d.1",$1,$2,$3}')"
+  else IPV4_GW="$NET_JAVA_GW"; fi
+else
+  IPV4_SEED="${NET_BEDROCK_START}"; IPV4_PFX="${NET_BEDROCK_PREFIX:-24}"
+  if [[ "${NET_BEDROCK_GW:-auto}" == "auto" || -z "${NET_BEDROCK_GW:-}" ]]; then
+    IPV4_GW="$(first_host "$IPV4_SEED" "$IPV4_PFX")"
+    [[ "$IPV4_PFX" == "24" ]] && IPV4_GW="$(echo "$IPV4_SEED" | awk -F. '{printf "%d.%d.%d.1",$1,$2,$3}')"
+  else IPV4_GW="$NET_BEDROCK_GW"; fi
+fi
+IPV4_ADDR="$(next_free_ip "$IPV4_SEED" "$IPV4_PFX")" || {
+  err "No free IPs available in $(network_of "$IPV4_SEED" "$IPV4_PFX")/$IPV4_PFX"; exit 1;
+}
+
+echo "=== Minecraft Server Setup ==="
+
+# ----- Simple helpers -----
+ctid_exists(){ pct config "$1" >/dev/null 2>&1; }
+port_in_use_host(){ ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
+seed_port(){ [[ ${1:-Java} == Bedrock ]] && echo 19132 || echo 25565; }
+
+next_free_ctid_port(){
+  local start=$1 p=$start
+  while :; do
+    if ! ctid_exists "$p" && ! port_in_use_host "$p"; then
+      echo "$p"; return 0
+    fi
+    p=$((p+1))
+    (( p <= 65535 )) || { err "No free CTID/port found above $start"; return 1; }
+  done
+}
+
+# Edition
+if [[ -z "$EDITION" ]]; then read -r -p "Server Edition [Java]: " EDITION; EDITION=${EDITION:-Java}; fi
+if [[ $EDITION != "Java" && $EDITION != "Bedrock" ]]; then err "Edition must be 'Java' or 'Bedrock'"; exit 1; fi
+
+# Version
+if [[ -z "$VERSION" ]]; then read -r -p "Minecraft Version [Latest]: " VERSION; VERSION=${VERSION:-Latest}; fi
+
+# Memory
+if [[ -z "$MEM" ]]; then read -r -p "Memory (MB) [4096]: " MEM; MEM=${MEM:-4096}; fi
+validate_numeric "$MEM" || { err "Memory must be numeric (MB)"; exit 1; }
+
+# Cores
+if [[ -z "$CORES" ]]; then read -r -p "CPU cores [2]: " CORES; CORES=${CORES:-2}; fi
+validate_numeric "$CORES" || { err "Cores must be numeric"; exit 1; }
+
+# Backup HHMM
+if [[ -z "$BKT" ]]; then
+  while true; do read -r -p "Daily backup time (HHMM, 24h) [0400]: " BKT; BKT=${BKT:-0400}; if validate_hhmm "$BKT"; then break; else warn "Invalid HHMM. Try again."; fi; done
+else
+  validate_hhmm "$BKT" || { err "Invalid --backup-hhmm (use HHMM)"; exit 1; }
+fi
+
+# --- Auto CTID/Port selection (CTID=Port enforced) ---
+if [[ -n "$CTID_IN" || -n "$PORT_IN" ]]; then
+  [[ -z "$CTID_IN" ]] && CTID_IN=$PORT_IN
+  [[ -z "$PORT_IN" ]] && PORT_IN=$CTID_IN
+  [[ "$CTID_IN" == "$PORT_IN" ]] || { err "CTID and Port must match (CTID=Port policy)."; exit 1; }
+  validate_numeric "$CTID_IN" || { err "CTID/Port must be numeric"; exit 1; }
+  (( CTID_IN >= 1 && CTID_IN <= 65535 )) || { err "CTID/Port must be 1-65535"; exit 1; }
+  ctid_exists "$CTID_IN" && { err "CTID $CTID_IN already exists"; exit 1; }
+  port_in_use_host "$PORT_IN" && { err "Port $PORT_IN is in use on host"; exit 1; }
+  CTID=$CTID_IN; PORT=$PORT_IN
+else
+  SEED=$(seed_port "$EDITION"); PICK=$(next_free_ctid_port "$SEED"); CTID=$PICK; PORT=$PICK
+fi
+
+# Hostname
+if [[ -z "$HN" ]]; then read -r -p "Hostname [mc-$CTID]: " HN; HN=${HN:-mc-$CTID}; fi
+
+# --- Template selection via helper (no default unless saved & valid) ---
+TEMPLATE="$(/usr/bin/env bash /usr/share/mc-server-tools/commands/mc-select-template \
+  --template "${TEMPLATE_IN:-}" \
+  --default  "${DEFAULT_TEMPLATE:-}")"
+set_config_var DEFAULT_TEMPLATE "$TEMPLATE"
+
+# RootFS storage (prefer local-lvm, else local)
+STOR=$(pvesm status 2>/dev/null | awk 'NR>1 && $1=="local-lvm"{print $1}' | head -n1)
+STOR=${STOR:-local}
+
+info "Summary"
+echo "CTID:      $CTID"
+echo "Hostname:  $HN"
+echo "Edition:   $EDITION"
+echo "Version:   $VERSION"
+echo "Memory:    ${MEM}MB"
+echo "Cores:     $CORES"
+echo "IPv4:      ${IPV4_ADDR}/${IPV4_PFX}  gw ${IPV4_GW}"
+echo "Port:      $PORT"
+echo "Template:  $TEMPLATE"
+echo "Disk:      ${DISK_GB}G on $STOR"
+echo "Autostart: Yes (always)"
+echo "Backups:   Daily @ ${BKT:0:2}:${BKT:2:2}"
+
+info "Creating container CT $CTID..."
+pct create "$CTID" "$TEMPLATE" \
+  -hostname "$HN" \
+  -cores "$CORES" \
+  -memory "$MEM" \
+  -swap 0 \
+  -net0 "name=eth0,bridge=${BRIDGE},ip=${IPV4_ADDR}/${IPV4_PFX},gw=${IPV4_GW}" \
+  -rootfs "$STOR:${DISK_GB}" \
+  -unprivileged 1 \
+  -onboot 1
+
+info "Starting CT $CTID..."; pct start "$CTID"
+
+if [[ $EDITION == "Java" ]]; then
+  info "Installing Java (official Mojang vanilla) and server jar (as mcadmin)..."
+  pct exec "$CTID" -- env MC_VER="$VERSION" bash -lc '
+    set -e
+    apt-get update
+    apt-get install -y openjdk-21-jre-headless curl jq screen
+    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
+    install -d -o mcadmin -g mcadmin /opt/minecraft
+    cd /opt/minecraft
+    VER="${MC_VER:-Latest}"
+    if [[ "$VER" == "Latest" || "$VER" == "latest" ]]; then
+      VER=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r ".latest.release")
+    fi
+    MANIFEST_URL=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg v "$VER" ".versions[] | select(.id==$v) | .url" | head -n1)
+    if [[ -z "$MANIFEST_URL" || "$MANIFEST_URL" == "null" ]]; then
+      echo "Requested version $VER not found; falling back to latest release" >&2
+      VER=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r ".latest.release")
+      MANIFEST_URL=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg v "$VER" ".versions[] | select(.id==$v) | .url" | head -n1)
+    fi
+    JAR_URL=$(curl -fsSL "$MANIFEST_URL" | jq -r ".downloads.server.url")
+    curl -fSL -o server.jar "$JAR_URL"
+    echo "eula=true" > eula.txt
+    chown -R mcadmin:mcadmin /opt/minecraft
+  '
+
+  info "Creating start script and service (runs as mcadmin)..."
+  pct exec "$CTID" -- env MEM="$MEM" bash -lc 'cat >/usr/local/bin/mc-start << "EOS"
+#!/usr/bin/env bash
+set -e
+cd /opt/minecraft
+# keep session name "mc" for tooling compatibility
+su -s /bin/bash - mcadmin -c "screen -dmS mc java -Xms512M -Xmx${MEM}M -jar server.jar nogui"
+EOS
+chmod +x /usr/local/bin/mc-start'
+
+  pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service << "EOF"
+[Unit]
+Description=Minecraft Server (Vanilla)
+After=network.target
+
+[Service]
+Type=forking
+User=root
+ExecStart=/usr/local/bin/mc-start
+ExecStop=/usr/bin/screen -S mc -p 0 -X stuff "stop^M"
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable minecraft.service'
+
+else
+  info "Setting up Bedrock (as mcadmin)"
+  pct exec "$CTID" -- bash -lc '
+    set -e
+    apt-get update
+    apt-get install -y unzip curl screen
+    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
+    install -d -o mcadmin -g mcadmin /opt/bedrock
+    cd /opt/bedrock
+    BEDROCK_URL=$(curl -fsSL https://www.minecraft.net/en-us/download/server/bedrock | grep -oE "https://minecraft\.azureedge\.net/bin-linux/bedrock-server-[0-9\.]+\.zip" | head -n1)
+    if [[ -z "$BEDROCK_URL" ]]; then echo "Failed to detect Bedrock server URL" >&2; exit 1; fi
+    curl -fsSL -o bedrock-server.zip "$BEDROCK_URL"
+    unzip -o bedrock-server.zip
+    chown -R mcadmin:mcadmin /opt/bedrock
+  '
+
+  info "Creating start script and service (runs as mcadmin)..."
+  pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start << "EOS"
+#!/usr/bin/env bash
+set -e
+cd /opt/bedrock
+# keep session name "mc" for tooling compatibility
+su -s /bin/bash - mcadmin -c "cd /opt/bedrock; screen -dmS mc env LD_LIBRARY_PATH=. ./bedrock_server"
+EOS
+chmod +x /usr/local/bin/mc-start
+
+cat >/etc/systemd/system/minecraft.service << "EOF"
+[Unit]
+Description=Minecraft Bedrock Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=root
+ExecStart=/usr/local/bin/mc-start
+ExecStop=/usr/bin/screen -S mc -p 0 -X stuff "stop^M"
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable minecraft.service'
+fi
+
+# --- Backups via host cron (vzdump) ---
+H=${BKT:0:2}; M=${BKT:2:2}
+CRONFILE="/etc/cron.d/mc-server-${CTID}"
+echo "$M $H * * * root /usr/bin/mc backup $CTID" > "$CRONFILE"
+chmod 0644 "$CRONFILE"
+
+info "Done! Use: mc start $CTID | mc logs $CTID | mc console $CTID | mc stop $CTID | mc backup $CTID | mc list"
