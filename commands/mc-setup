@@ -109,7 +109,6 @@ installed_templates() {
   # Output format: <storage>:vztmpl/<file>
   local s path
   while read -r s; do
-    # Determine path for dir-backed storages
     if [[ "$s" == "local" ]]; then
       path=/var/lib/vz/template/cache
     else
@@ -123,6 +122,132 @@ installed_templates() {
       done
     fi
   done < <(pvesm status 2>/dev/null | awk 'NR>1{print $1}')
+}
+
+# Return the on-disk cache path for a storage name
+_template_cache_path_for_storage() {
+  local s="$1"
+  if [[ "$s" == "local" ]]; then
+    echo /var/lib/vz/template/cache
+  else
+    echo "/mnt/pve/$s/template/cache"
+  fi
+}
+
+# Check if a fully-qualified template (storage:vztmpl/file) is installed
+_template_exists() {
+  local sel="$1"
+  [[ "$sel" == *":vztmpl/"* ]] || return 1
+  local storage file
+  storage="${sel%%:vztmpl/*}"
+  file="${sel##*:vztmpl/}"
+  local path; path=$(_template_cache_path_for_storage "$storage")
+  [[ -f "$path/$file" ]]
+}
+
+# List storages that can hold templates (all storages known to PVE)
+_dir_storages() {
+  pvesm status 2>/dev/null | awk 'NR>1{print $1}'
+}
+
+# List catalog templates available to download (names only)
+_available_templates_catalog() {
+  pveam available --section system 2>/dev/null | awk 'NR>1 && $2!="" {print $2}'
+}
+
+# Prompt for a storage (defaults to 'local' if present)
+_choose_storage() {
+  local -a arr; mapfile -t arr < <(_dir_storages)
+  ((${#arr[@]})) || { err "No storages found via pvesm status"; return 1; }
+  local def_idx=1
+  local i
+  for i in "${!arr[@]}"; do [[ "${arr[$i]}" == "local" ]] && def_idx=$((i+1)); done
+  {
+    echo "Storages:"; for i in "${!arr[@]}"; do printf '  %d) %s
+' "$((i+1))" "${arr[$i]}"; done; echo; 
+  } >&2
+  local choice
+  read -r -p "Choose storage for download [${def_idx}]: " choice
+  if [[ -z "$choice" ]]; then echo "${arr[$((def_idx-1))]}"; return; fi
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then echo "${arr[$((choice-1))]}"; return; fi
+  echo "$choice"
+}
+
+# Download flow: pick storage & template name from catalog, download, return fully-qualified path
+_download_template_dialog() {
+  local storage name
+  storage=$(_choose_storage) || return 1
+  local -a cats; mapfile -t cats < <(_available_templates_catalog)
+  ((${#cats[@]})) || { err "No catalog entries from pveam available"; return 1; }
+  {
+    echo "Available templates:"; 
+    local show=$(( ${#cats[@]}<20 ? ${#cats[@]} : 20 ))
+    local i; for ((i=0;i<show;i++)); do printf '  %d) %s
+' "$((i+1))" "${cats[$i]}"; done; echo;
+  } >&2
+  local choice
+  read -r -p "Download which? (number or full name) [1]: " choice
+  if [[ -z "$choice" ]]; then name="${cats[0]}"; 
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#cats[@]} )); then name="${cats[$((choice-1))]}"; 
+  else name="$choice"; fi
+  info "Downloading $name to $storage..."
+  pveam download "$storage" "$name"
+  echo "$storage:vztmpl/$name"
+}
+
+select_template() {
+  local -a arr; mapfile -t arr < <(installed_templates)
+
+  if (( ${#arr[@]} == 0 )); then
+    { echo "No installed templates found."; } >&2
+    local ans
+    read -r -p "Download a template now? [Y/n]: " ans
+    ans=${ans:-Y}
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      local sel; sel=$(_download_template_dialog) || { err "Download failed"; exit 1; }
+      set_config_var DEFAULT_TEMPLATE "$sel"
+      echo "$sel"; return
+    else
+      err "Aborting: no templates installed."; exit 1
+    fi
+  fi
+
+  { echo "Installed templates:"; local i; for i in "${!arr[@]}"; do printf '  %d) %s
+' "$((i+1))" "${arr[$i]}"; done; echo; } >&2
+
+  # Default from config if present and matches; otherwise first entry
+  local def_idx=1
+  if [[ -n "${DEFAULT_TEMPLATE:-}" ]]; then
+    local idx; for idx in "${!arr[@]}"; do [[ "${arr[$idx]}" == "$DEFAULT_TEMPLATE" ]] && { def_idx=$((idx+1)); break; }; done
+  fi
+
+  local choice raw sel
+  read -r -p "Choose template [${def_idx}] or 'd' to download: " choice
+  if [[ -z "$choice" ]]; then
+    sel="${arr[$((def_idx-1))]}"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then
+    sel="${arr[$((choice-1))]}"
+  elif [[ "$choice" =~ ^[dD]$ ]]; then
+    sel=$(_download_template_dialog) || { err "Download failed"; exit 1; }
+  else
+    raw=$choice
+    if [[ "$raw" == *":vztmpl/"* ]]; then
+      _template_exists "$raw" || { err "Template '$raw' not installed"; exit 1; }
+      sel="$raw"
+    else
+      # Match by filename across installed set
+      local -a matches; matches=()
+      local fn; fn="$raw"
+      local it
+      for it in "${arr[@]}"; do [[ "${it##*:vztmpl/}" == "$fn" ]] && matches+=("$it"); done
+      if (( ${#matches[@]} == 1 )); then sel="${matches[0]}"; else err "Template '$fn' ambiguous/not found"; exit 1; fi
+    fi
+  fi
+
+  sel=$(printf '%s' "$sel" | tr -d '
+' | awk '{sub(/[ 	]+$/,""); print}')
+  set_config_var DEFAULT_TEMPLATE "$sel"
+  echo "$sel"
 }
 
 set_config_var() { # $1=KEY $2=VALUE
@@ -205,13 +330,16 @@ select_template() {
     err "No installed templates found. Use 'pveam download local <name>' first."; exit 1
   fi
 
-  echo "Installed templates:";
-  local i
-  for i in "${!arr[@]}"; do
-    printf '  %d) %s
+  # Print menu to STDERR so command substitution doesn't capture it
+  {
+    echo "Installed templates:"
+    local i
+    for i in "${!arr[@]}"; do
+      printf '  %d) %s
 ' "$((i+1))" "${arr[$i]}"
-  done
-  echo
+    done
+    echo
+  } >&2
 
   # Default from config if present and matches; otherwise first entry
   local def_idx=1
@@ -223,6 +351,7 @@ select_template() {
   fi
 
   local choice sel
+  # read -p prints prompt to STDERR by default (safe for command substitution)
   read -r -p "Choose template [${def_idx}]: " choice
   if [[ -z "$choice" ]]; then
     sel="${arr[$((def_idx-1))]}"
@@ -233,7 +362,11 @@ select_template() {
     sel="$choice"
   fi
 
-  # Persist and return
+  # Sanitize selection (strip CR/trailing spaces)
+  sel=$(printf '%s' "$sel" | tr -d '
+' | awk '{sub(/[ 	]+$/,""); print}')
+
+  # Persist and return ONLY the selection on STDOUT
   set_config_var DEFAULT_TEMPLATE "$sel"
   echo "$sel"
 }
@@ -300,12 +433,31 @@ if [[ -z "$HN" ]]; then
   HN=${HN:-mc-$CTID}
 fi
 
-# Template selection (installed-only; persists to config)
-if [[ -z "$TEMPLATE_IN" ]]; then
-  TEMPLATE=$(select_template)
-else
-  TEMPLATE=$TEMPLATE_IN
+# Template selection with validation + download option
+if [[ -n "$TEMPLATE_IN" ]]; then
+  # Accept fully-qualified storage:vztmpl/file directly if installed
+  if _template_exists "$TEMPLATE_IN"; then
+    TEMPLATE="$TEMPLATE_IN"
+  else
+    # If only a filename was provided, try to resolve to an installed template
+    if [[ "$TEMPLATE_IN" != *":vztmpl/"* ]]; then
+      mapfile -t _arr_inst < <(installed_templates)
+      _match=()
+      for it in "${_arr_inst[@]}"; do [[ "${it##*:vztmpl/}" == "$TEMPLATE_IN" ]] && _match+=("$it"); done
+      if (( ${#_match[@]} == 1 )); then
+        TEMPLATE="${_match[0]}"
+      else
+        info "Template '$TEMPLATE_IN' not installed or ambiguous. Launching downloader..."
+        TEMPLATE=$(_download_template_dialog) || { err "Download failed"; exit 1; }
+      fi
+    else
+      info "Template '$TEMPLATE_IN' not installed. Launching downloader..."
+      TEMPLATE=$(_download_template_dialog) || { err "Download failed"; exit 1; }
+    fi
+  fi
   set_config_var DEFAULT_TEMPLATE "$TEMPLATE"
+else
+  TEMPLATE=$(select_template)
 fi
 
 info "Summary"
