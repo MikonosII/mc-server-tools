@@ -30,7 +30,7 @@ mc-server-tools
 Usage:
   mc setup [options]                # interactive setup (LXC + server install)
   mc new   [options]                # non-interactive create (if present)
-  mc copy  <SRC_CTID> [flags...]    # clone server into a new CT (no "to/from")
+  mc copy  <SRC_CTID> [--storage NAME] [--disk-gb N] [--mem MB] [--cores N] [--backup-hhmm HHMM] [--version STR] [--template STORAGE:vztmpl/file]
   mc list                           # show servers and basic info
   mc status <CTID>                  # show service/screen status for a CT
   mc start  <CTID>
