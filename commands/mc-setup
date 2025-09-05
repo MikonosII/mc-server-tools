@@ -134,6 +134,16 @@ IPV4_ADDR="$(next_free_ip "$IPV4_SEED" "$IPV4_PFX")" || {
 echo "Selected IPv4 address: ${IPV4_ADDR}/${IPV4_PFX}"
 echo "Gateway: ${IPV4_GW}"
 
+# Sanity check: make sure the gateway responds
+if ! ping -c1 -W2 "$IPV4_GW" >/dev/null 2>&1; then
+  warn "Gateway $IPV4_GW did not respond to ping. The container may not have internet."
+  read -r -p "Continue anyway? [y/N]: " yn
+  case "$yn" in
+    [Yy]*) ;;
+    *) err "Aborting due to unreachable gateway"; exit 1;;
+  esac
+fi
+
 echo "=== Minecraft Server Setup ==="
 
 # ----- Simple helpers -----
