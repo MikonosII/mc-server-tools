@@ -1,0 +1,16 @@
+Source: mc-server-tools
+Section: admin
+Priority: optional
+Maintainer: Your Name <you@example.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/yourorg/mc-server-tools
+Rules-Requires-Root: no
+
+Package: mc-server-tools
+Version: @VERSION@
+Architecture: all
+Depends: ${misc:Depends}, bash, lxc | proxmox-ve, curl, jq
+Description: Minecraft server tools for Proxmox LXC
+ Utilities and scripts to create and manage Minecraft servers in LXC.
+ Includes preflight hardening, setup helpers, and convenience commands.
