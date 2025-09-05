@@ -1,24 +1,4 @@
 #!/usr/bin/env bash
-# mc-attach — attach to the minecraft screen session inside a CT
+# mc-attach — alias to mc-console for convenience
 set -euo pipefail
-
-usage() {
-  cat <<'EOF'
-Usage: mc attach <CTID>
-
-Attaches to the "minecraft" screen session inside the container.
-Detach with: Ctrl+A then D
-EOF
-}
-
-ctid="${1:-}"
-[[ -z "$ctid" ]] && { usage >&2; exit 2; }
-
-# quick sanity
-if ! pct status "$ctid" >/dev/null 2>&1; then
-  echo "[mc-attach] CTID $ctid not found" >&2
-  exit 1
-fi
-
-# attach as mcadmin; -xRR -> attach or create/resume
-exec pct exec "$ctid" -- sudo -u mcadmin screen -xRR minecraft
+exec /usr/bin/env bash /usr/share/mc-server-tools/commands/mc-console "$@"
