@@ -36,8 +36,8 @@ VERSION := $(strip $(VERSION))
 
 # --- Inputs ---
 DISPATCHER    := usr/bin/mc
-COMMANDS      := commands/mc-setup commands/mc-preflight
-LIBS          := lib/common.sh lib/preflight.sh
+COMMANDS := $(shell [ -d commands ] && find commands -maxdepth 1 -type f ! -name 'README*' ! -name '*.md' -print | sort || true)
+LIBS     := $(shell [ -d lib ] && find lib      -maxdepth 1 -type f -print | sort || true)
 CONF_DEFAULT  := debpkg/etc/config
 
 # --- Staging / output paths ---
@@ -69,19 +69,27 @@ all: clean tree
 	$(call echo_kv,DEBFILE,$(DEBFILE))
 
 tree:
-	# Stage filesystem into $(PKGROOT)
+	@echo "[tree] staging files"
 	install -d "$(PKGROOT)$(BINDIR)" \
 	         "$(PKGROOT)$(CMDDIR)" \
 	         "$(PKGROOT)$(LIBDIR)" \
 	         "$(PKGROOT)$(SYSCONFDIR)"
-	# Dispatcher (single entrypoint for commands)
-	install -m0755 "$(DISPATCHER)"     "$(PKGROOT)$(BINDIR)/mc"
-	# Commands (+x)
-	install -m0755 $(COMMANDS)         "$(PKGROOT)$(CMDDIR)/"
-	# Libraries (read-only)
-	install -m0644 $(LIBS)             "$(PKGROOT)$(LIBDIR)/"
+	# Dispatcher
+	install -m0755 "$(DISPATCHER)" "$(PKGROOT)$(BINDIR)/mc"
+	# Commands (install if any)
+ifneq ($(strip $(COMMANDS)),)
+	install -m0755 $(COMMANDS) "$(PKGROOT)$(CMDDIR)/"
+else
+	@echo "[tree] (no commands found under ./commands)"
+endif
+	# Libraries (install if any)
+ifneq ($(strip $(LIBS)),)
+	install -m0644 $(LIBS) "$(PKGROOT)$(LIBDIR)/"
+else
+	@echo "[tree] (no libs found under ./lib)"
+endif
 	# Default config
-	if [ -f "$(CONF_DEFAULT)" ]; then install -m0644 "$(CONF_DEFAULT)" "$(PKGROOT)$(SYSCONFDIR)/config"; fi
+	if [ -f "debpkg/etc/config" ]; then install -m0644 "debpkg/etc/config" "$(PKGROOT)$(SYSCONFDIR)/config"; fi
 
 install:
 	# Local install from staged tree (for dev machines)
