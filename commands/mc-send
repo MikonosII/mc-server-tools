@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# mc-send — send a command to the minecraft screen session inside a CT
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: mc send <CTID> <command...>
+
+Examples:
+  mc send 25565 "list"
+  mc send 25565 "save-all"
+EOF
+}
+
+ctid="${1:-}"; shift || true
+[[ -z "$ctid" || $# -eq 0 ]] && { usage >&2; exit 2; }
+cmd="$*"
+
+# ensure CT exists
+if ! pct status "$ctid" >/dev/null 2>&1; then
+  echo "[mc-send] CTID $ctid not found" >&2
+  exit 1
+fi
+
+# ensure a screen session named 'minecraft' exists, otherwise error
+if ! pct exec "$ctid" -- bash -lc 'screen -ls | grep -q "[[:space:]]minecraft[[:space:]]"' ; then
+  echo "[mc-send] No 'minecraft' screen session found in CT $ctid" >&2
+  exit 1
+fi
+
+# pass the full command safely (preserves spaces) and send CR
+printf '%s\r' "$cmd" | pct exec "$ctid" -- bash -lc '
+  IFS= read -r line
+  screen -S minecraft -X stuff "$line"
+'
