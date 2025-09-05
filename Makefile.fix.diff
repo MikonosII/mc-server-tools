@@ -1,0 +1,56 @@
+*** a/Makefile
+--- b/Makefile
+***************
+*** 1,20 ****
+--- 1,20 ----
+  # (context above your tree target unchanged)
+  
+  PKGROOT  ?= build/pkgroot
+  BINDIR   ?= /usr/bin
+  ROOTDIR  ?= /usr/share/mc-server-tools
+  CMDDIR   ?= $(ROOTDIR)/commands
+  LIBDIR   ?= $(ROOTDIR)/lib
+  
+  # Auto-discover files
+  COMMANDS := $(shell [ -d commands ] && find commands -maxdepth 1 -type f -print | sort || true)
+  LIBS     := $(shell [ -d lib ] && find lib -maxdepth 1 -type f -print | sort || true)
+  
+  .PHONY: tree
+  tree:
+  	@echo "[tree] staging files"
+  	install -d "$(PKGROOT)$(BINDIR)" \
++ 	        "$(PKGROOT)$(CMDDIR)" \
++ 	        "$(PKGROOT)$(LIBDIR)" \
++ 	        "$(PKGROOT)/etc/mc-server-tools"
++ 
++ 	# Dispatcher
++ 	install -m0755 "usr/bin/mc" "$(PKGROOT)$(BINDIR)/mc"
++ 
++ 	# Commands (install if any)
+- 	        "$(PKGROOT)$(CMDDIR)" \
+- 	        "$(PKGROOT)$(LIBDIR)" \
+- 	        "$(PKGROOT)/etc/mc-server-tools"
+- 
+- 	# Dispatcher
+- 	install -m0755 "usr/bin/mc" "$(PKGROOT)$(BINDIR)/mc"
+- 
+- 	# Commands (install if any)
+- 	ifneq (commands/mc-attach commands/mc-backup commands/mc-console commands/mc-copy commands/mc-delete commands/mc-list commands/mc-logs commands/mc-new commands/mc-preflight commands/mc-restart commands/mc-select-template commands/mc-send commands/mc-setup commands/mc-start commands/mc-stop,)
+- 	install -m0755 $(COMMANDS) "$(PKGROOT)$(CMDDIR)/"
+- 	else
+- 	@echo "[tree] (no commands found under ./commands)"
+- 	endif
++ ifneq ($(strip $(COMMANDS)),)
++ 	@echo "[tree] installing commands: $(COMMANDS)"
++ 	install -m0755 $(COMMANDS) "$(PKGROOT)$(CMDDIR)/"
++ else
++ 	@echo "[tree] (no commands found under ./commands)"
++ endif
++ 
++ 	# Libraries (sourced only, not executable)
++ ifneq ($(strip $(LIBS)),)
++ 	@echo "[tree] installing libs: $(LIBS)"
++ 	install -m0644 $(LIBS) "$(PKGROOT)$(LIBDIR)/"
++ else
++ 	@echo "[tree] (no libs found under ./lib)"
++ endif
