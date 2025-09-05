@@ -460,32 +460,156 @@ if [[ -z "$HN" ]]; then
   HN=${HN:-mc-$CTID}
 fi
 
-# Template selection with validation + download option
-if [[ -n "$TEMPLATE_IN" ]]; then
-  # Accept fully-qualified storage:vztmpl/file directly if installed
-  if _template_exists "$TEMPLATE_IN"; then
-    TEMPLATE="$TEMPLATE_IN"
-  else
-    # If only a filename was provided, try to resolve to an installed template
-    if [[ "$TEMPLATE_IN" != *":vztmpl/"* ]]; then
-      mapfile -t _arr_inst < <(installed_templates)
-      _match=()
-      for it in "${_arr_inst[@]}"; do [[ "${it##*:vztmpl/}" == "$TEMPLATE_IN" ]] && _match+=("$it"); done
-      if (( ${#_match[@]} == 1 )); then
-        TEMPLATE="${_match[0]}"
-      else
-        info "Template '$TEMPLATE_IN' not installed or ambiguous. Launching downloader..."
-        TEMPLATE=$(_download_template_dialog) || { err "Download failed"; exit 1; }
+# Template selection (POSIX-safe, inline; persists to config)
+# Result: sets TEMPLATE to a fully-qualified storage:vztmpl/file
+{
+  TEMPLATE=""
+  # If user supplied --template, try to validate/resolve first
+  if [ -n "${TEMPLATE_IN:-}" ]; then
+    case "$TEMPLATE_IN" in
+      *:vztmpl/*)
+        # Fully qualified; ensure installed, else offer download
+        storage=${TEMPLATE_IN%%:vztmpl/*}
+        file=${TEMPLATE_IN##*:vztmpl/}
+        [ "$storage" = "local" ] && cache=/var/lib/vz/template/cache || cache=/mnt/pve/$storage/template/cache
+        if [ -f "$cache/$file" ]; then
+          TEMPLATE="$TEMPLATE_IN"
+        else
+          info "Template '$TEMPLATE_IN' not installed."
+        fi
+        ;;
+      *)
+        # Bare filename; try to match installed later
+        ;;
+    esac
+  fi
+
+  if [ -z "$TEMPLATE" ]; then
+    # Build installed list
+    T_LIST=$(mktemp) || { err "mktemp failed"; exit 1; }
+    trap 'rm -f "$T_LIST"' EXIT
+    pvesm status 2>/dev/null | awk 'NR>1{print $1}' | while read -r s; do
+      if [ "$s" = "local" ]; then path=/var/lib/vz/template/cache; else path=/mnt/pve/$s/template/cache; fi
+      if [ -d "$path" ]; then
+        find "$path" -maxdepth 1 -type f -printf '%f
+' 2>/dev/null | while read -r f; do printf '%s:vztmpl/%s
+' "$s" "$f"; done
       fi
-    else
-      info "Template '$TEMPLATE_IN' not installed. Launching downloader..."
-      TEMPLATE=$(_download_template_dialog) || { err "Download failed"; exit 1; }
+    done >"$T_LIST"
+
+    count=$(wc -l < "$T_LIST" | tr -d ' ')
+
+    # If user gave a bare filename, try to resolve across installed list
+    if [ -z "$TEMPLATE" ] && [ -n "${TEMPLATE_IN:-}" ] && [ "$TEMPLATE_IN" != "${TEMPLATE_IN%:*}" ]; then :; fi
+    if [ -z "$TEMPLATE" ] && [ -n "${TEMPLATE_IN:-}" ] && printf '%s' "$TEMPLATE_IN" | grep -vq ':vztmpl/'; then
+      match=$(awk -v fn="$TEMPLATE_IN" -F':vztmpl/' '$2==fn{print; c++} END{ if(c!=1) print "__AMBIG__" }' "$T_LIST")
+      if [ "$match" = "__AMBIG__" ]; then info "Filename '$TEMPLATE_IN' ambiguous/not found among installed templates."; fi
+      if [ -n "$match" ] && [ "$match" != "__AMBIG__" ]; then TEMPLATE="$match"; fi
+    fi
+
+    if [ -z "$TEMPLATE" ] && [ "$count" -eq 0 ]; then
+      # No installed templates; offer to download
+      echo "No installed templates found." >&2
+      read -r -p "Download a template now? [Y/n]: " choice
+      choice=${choice:-Y}
+      if printf '%s' "$choice" | grep -Eq '^[Yy]$'; then
+        # Choose storage
+        S_LIST=$(mktemp) || { err "mktemp failed"; exit 1; }
+        trap 'rm -f "$S_LIST"' EXIT
+        pvesm status 2>/dev/null | awk 'NR>1{print $1}' >"$S_LIST"
+        if ! [ -s "$S_LIST" ]; then err "No storages from pvesm status"; exit 1; fi
+        def_idx=$(nl -w1 -s: "$S_LIST" | awk -F: '$2=="local"{print $1; f=1; exit} END{ if(!f) print 1 }')
+        { echo "Storages:"; nl -w1 -s') ' "$S_LIST"; echo; } >&2
+        read -r -p "Choose storage for download [${def_idx}]: " st_choice
+        if [ -z "$st_choice" ]; then storage=$(sed -n "${def_idx}p" "$S_LIST");
+        elif printf '%s' "$st_choice" | grep -Eq '^[0-9]+$'; then storage=$(sed -n "${st_choice}p" "$S_LIST");
+        else storage="$st_choice"; fi
+        [ -n "$storage" ] || { err "No storage selected"; exit 1; }
+        # Catalog
+        C_LIST=$(mktemp) || { err "mktemp failed"; exit 1; }
+        trap 'rm -f "$C_LIST"' EXIT
+        pveam available --section system 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' >"$C_LIST"
+        if ! [ -s "$C_LIST" ]; then err "No catalog entries from pveam"; exit 1; fi
+        { echo "Available templates (top 20):"; head -n 20 "$C_LIST" | nl -w1 -s') '; echo; } >&2
+        read -r -p "Download which? (number or full name) [1]: " t_choice
+        if [ -z "$t_choice" ]; then name=$(sed -n '1p' "$C_LIST");
+        elif printf '%s' "$t_choice" | grep -Eq '^[0-9]+$'; then name=$(sed -n "${t_choice}p" "$C_LIST");
+        else name="$t_choice"; fi
+        [ -n "$name" ] || { err "No template selected"; exit 1; }
+        info "Downloading $name to $storage..."
+        pveam download "$storage" "$name"
+        TEMPLATE="$storage:vztmpl/$name"
+      else
+        err "Aborting: no templates installed."; exit 1
+      fi
+    fi
+
+    if [ -z "$TEMPLATE" ]; then
+      # Show installed list and prompt (no default unless config matches)
+      { echo "Installed templates:"; nl -w1 -s') ' "$T_LIST"; echo; } >&2
+      def_idx=$(nl -w1 -s: "$T_LIST" | awk -F: -v d="${DEFAULT_TEMPLATE:-}" '$2==d{print $1; f=1} END{ if(!f) print "" }')
+      if [ -n "$def_idx" ]; then
+        prompt="Choose template [${def_idx}] or 'd' to download: "
+      else
+        prompt="Choose template (number) or 'd' to download: "
+      fi
+      while :; do
+        read -r -p "$prompt" choice
+        if [ -z "$choice" ]; then
+          if [ -n "$def_idx" ]; then TEMPLATE=$(sed -n "${def_idx}p" "$T_LIST"); break; fi
+          echo "Please enter a number or 'd' to download." >&2; continue
+        fi
+        if printf '%s' "$choice" | grep -Eq '^[0-9]+$'; then
+          TEMPLATE=$(sed -n "${choice}p" "$T_LIST"); [ -n "$TEMPLATE" ] || { echo "Invalid number" >&2; continue; }; break
+        fi
+        if printf '%s' "$choice" | grep -Eq '^[dD]$'; then
+          # Recurse download path
+          # Choose storage
+          S_LIST=$(mktemp) || { err "mktemp failed"; exit 1; }
+          trap 'rm -f "$S_LIST"' EXIT
+          pvesm status 2>/dev/null | awk 'NR>1{print $1}' >"$S_LIST"
+          def_idx_s=$(nl -w1 -s: "$S_LIST" | awk -F: '$2=="local"{print $1; f=1; exit} END{ if(!f) print 1 }')
+          { echo "Storages:"; nl -w1 -s') ' "$S_LIST"; echo; } >&2
+          read -r -p "Choose storage for download [${def_idx_s}]: " st_choice
+          if [ -z "$st_choice" ]; then storage=$(sed -n "${def_idx_s}p" "$S_LIST");
+          elif printf '%s' "$st_choice" | grep -Eq '^[0-9]+$'; then storage=$(sed -n "${st_choice}p" "$S_LIST");
+          else storage="$st_choice"; fi
+          [ -n "$storage" ] || { err "No storage selected"; exit 1; }
+          C_LIST=$(mktemp) || { err "mktemp failed"; exit 1; }
+          trap 'rm -f "$C_LIST"' EXIT
+          pveam available --section system 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' >"$C_LIST"
+          [ -s "$C_LIST" ] || { err "No catalog entries from pveam"; exit 1; }
+          { echo "Available templates (top 20):"; head -n 20 "$C_LIST" | nl -w1 -s') '; echo; } >&2
+          read -r -p "Download which? (number or full name) [1]: " t_choice
+          if [ -z "$t_choice" ]; then name=$(sed -n '1p' "$C_LIST");
+          elif printf '%s' "$t_choice" | grep -Eq '^[0-9]+$'; then name=$(sed -n "${t_choice}p" "$C_LIST");
+          else name="$t_choice"; fi
+          [ -n "$name" ] || { err "No template selected"; exit 1; }
+          info "Downloading $name to $storage..."
+          pveam download "$storage" "$name"
+          TEMPLATE="$storage:vztmpl/$name"; break
+        fi
+        # Allow fully-qualified or filename here as well
+        raw="$choice"
+        if printf '%s' "$raw" | grep -q ':vztmpl/'; then
+          storage=${raw%%:vztmpl/*}; file=${raw##*:vztmpl/}
+          [ "$storage" = "local" ] && cache=/var/lib/vz/template/cache || cache=/mnt/pve/$storage/template/cache
+          if [ -f "$cache/$file" ]; then TEMPLATE="$raw"; break; else echo "Template '$raw' not installed." >&2; continue; fi
+        else
+          match=$(awk -v fn="$raw" -F':vztmpl/' '$2==fn{print; c++} END{ if(c!=1) print "__AMBIG__" }' "$T_LIST")
+          if [ "$match" = "__AMBIG__" ]; then echo "Filename '$raw' ambiguous/not found." >&2; continue; fi
+          if [ -z "$match" ]; then echo "Filename '$raw' not found." >&2; continue; fi
+          TEMPLATE="$match"; break
+        fi
+      done
     fi
   fi
+
+  # Persist default for next run and sanitize output
+  TEMPLATE=$(printf '%s' "$TEMPLATE" | tr -d '
+' | awk '{sub(/[ 	]+$/,""); print}')
   set_config_var DEFAULT_TEMPLATE "$TEMPLATE"
-else
-  TEMPLATE=$(select_template)
-fi
+}
 
 info "Summary"
 echo "CTID:      $CTID"
