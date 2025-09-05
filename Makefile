@@ -14,7 +14,7 @@ FILES_BIN    := commands/mc-preflight
 WRAPPER_SRC  := debian/wrappers/mc-setup
 WRAPPER_BIN  := $(BIN_DIR)/mc-setup
 
-VERSION      ?= 2.0.0
+VERSION      ?= $(VERSION)
 MAINTAINER   ?= Your Name <you@example.com>
 PKGROOT      := build/pkg
 DEBIAN_DIR   := $(PKGROOT)/DEBIAN
