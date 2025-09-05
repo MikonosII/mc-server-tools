@@ -1,66 +1,74 @@
 #!/usr/bin/env bash
+# /usr/bin/mc — dispatcher for mc-server-tools (matches repo semantics)
+# Subcommands are executed from: /usr/share/mc-server-tools/commands/mc-<subcommand>
+# Known commands in repo: setup, new, copy, list, logs, console, start, stop, restart, backup, delete
+# Special: `status` is handled inline (no mc-status file in repo)
+#
+# Debugging:
+#   MC_TRACE=1 mc <cmd> ...    # shell trace
+#
 set -euo pipefail
+[[ ${MC_TRACE:-0} == 1 ]] && set -x
 
-# Try to use your shared helpers, but fall back if missing.
+# ---------- Common helpers ----------
 if [[ -f /usr/share/mc-server-tools/lib/common.sh ]]; then
+  # shellcheck disable=SC1091
   . /usr/share/mc-server-tools/lib/common.sh
 else
   err(){ echo "ERROR: $*" >&2; }
-  warn(){ echo "WARN: $*" >&2; }
+  warn(){ echo "WARN:  $*" >&2; }
   info(){ echo "-- $*"; }
-  require_root(){ [[ $EUID -eq 0 ]] || { err "This command must be run as root"; exit 1; }; }
+  require_root(){ [[ $EUID -eq 0 ]] || { err "Run as root (sudo -i)"; exit 1; }; }
 fi
 
 require_root
 
 usage() {
-  cat <<EOF
+  cat <<'USAGE'
+mc-server-tools
+
 Usage:
-  mc list
-  mc status <CTID>
+  mc setup [options]                # interactive setup (LXC + server install)
+  mc new   [options]                # non-interactive create (if present)
+  mc copy  <SRC_CTID> [flags...]    # clone server into a new CT (no "to/from")
+  mc list                           # show servers and basic info
+  mc status <CTID>                  # show service/screen status for a CT
   mc start  <CTID>
   mc stop   <CTID>
   mc restart <CTID>
-  mc logs   <CTID> [LINES=200]
-  mc backup <CTID>   # vzdump snapshot with zstd
+  mc logs   <CTID> [N]              # tail service logs (default N=100/200 per script)
+  mc console <CTID>                 # attach to screen session
+  mc backup <CTID>                  # vzdump snapshot
+  mc delete <CTID>                  # if implemented in repo
 
 Notes:
-  - Works for both Java and Bedrock because both use a screen session named "mc".
-  - "logs" reads the minecraft.service journal inside the CT.
-EOF
+  - Subcommands are dispatched to /usr/share/mc-server-tools/commands/mc-<subcommand>.
+  - `mc copy` interface is exactly: mc copy <SRC_CTID> [--storage NAME] [--disk-gb N] [--mem N] [--cores N] [--backup-hhmm HHMM] [--version STR] [--template STORAGE:vztmpl/file]
+USAGE
 }
 
+# Normalize the subcommand (strip CR / surrounding whitespace)
+raw_cmd="${1:-}"
+cmd="$(printf '%s' "$raw_cmd" | tr -d '\r' | awk '{$1=$1;print}')"
+shift || true
+
+# ---------- Inline helpers used by `status` ----------
 ct_exists(){ pct config "$1" >/dev/null 2>&1; }
 ct_status(){ pct status "$1" 2>/dev/null | awk '{print $2}'; }  # running|stopped
 ct_running(){ [[ "$(ct_status "$1")" == "running" ]]; }
-
-screen_present() {
-  # returns 0 if 'mc' screen session exists inside CT
+screen_present(){
   pct exec "$1" -- bash -lc 'screen -ls 2>/dev/null | grep -q "\.mc"' >/dev/null
 }
 
-send_stop() {
-  # send "stop<Enter>" to the screen session inside CT
-  pct exec "$1" -- bash -lc '/usr/bin/screen -S mc -p 0 -X stuff "stop^M"' || true
-}
-
-wait_screen_gone() {
-  local id=$1 timeout=${2:-30}
-  local i=0
-  while (( i < timeout )); do
-    if ! screen_present "$id"; then return 0; fi
-    sleep 1; ((i++))
-  done
-  return 1
-}
-
-case "${1:-}" in
-  list)
-    pct list
+# ---------- Dispatch ----------
+case "${cmd:-help}" in
+  ""|-h|--help|help)
+    usage
     ;;
 
   status)
-    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
+    id=${1:-}
+    [[ -n "$id" ]] || { usage; exit 1; }
     ct_exists "$id" || { err "CTID $id not found"; exit 1; }
     s=$(ct_status "$id" || true)
     echo "CT $id: ${s:-unknown}"
@@ -78,59 +86,15 @@ case "${1:-}" in
     fi
     ;;
 
-  start)
-    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
-    ct_exists "$id" || { err "CTID $id not found"; exit 1; }
-    ct_running "$id" || { info "Starting CT $id"; pct start "$id"; }
-    info "Starting minecraft.service in CT $id"
-    pct exec "$id" -- systemctl start minecraft.service
-    ;;
-
-  stop)
-    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
-    ct_exists "$id" || { err "CTID $id not found"; exit 1; }
-    ct_running "$id" || { info "CT $id is not running"; exit 0; }
-
-    if screen_present "$id"; then
-      info "Sending 'stop' to screen session in CT $id"
-      send_stop "$id"
-      if wait_screen_gone "$id" 30; then
-        info "Screen session ended cleanly."
-      else
-        warn "Screen still present after 30s; asking systemd to stop."
-        pct exec "$id" -- systemctl stop minecraft.service || true
-        # Last resort: kill any leftover screen named mc (should be rare)
-        pct exec "$id" -- bash -lc 'pkill -f "SCREEN.*\\bmc\\b" || true'
-      fi
+  *)
+    # Generic: look for matching command script in /usr/share/mc-server-tools/commands/
+    script="/usr/share/mc-server-tools/commands/mc-${cmd}"
+    if [[ -x "$script" ]]; then
+      exec "$script" "$@"
     else
-      info "No screen session found; stopping service if running."
-      pct exec "$id" -- systemctl stop minecraft.service || true
+      err "Unknown subcommand: ${cmd}"
+      usage
+      exit 1
     fi
     ;;
-
-  restart)
-    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
-    "$0" stop "$id" || true
-    "$0" start "$id"
-    ;;
-
-  logs)
-    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
-    lines=${3:-200}
-    ct_running "$id" || { err "CT $id not running"; exit 1; }
-    pct exec "$id" -- journalctl -u minecraft.service --no-pager -n "$lines"
-    ;;
-
-  backup)
-    id=${2:-}; [[ -n "$id" ]] || { usage; exit 1; }
-    info "Starting vzdump snapshot backup of CT $id"
-    vzdump "$id" --mode snapshot --compress zstd
-    ;;
-
-  ""|-h|--help|help)
-    usage
-    ;;
-
-  *)
-    usage; exit 1;;
 esac
