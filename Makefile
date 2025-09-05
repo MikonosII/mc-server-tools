@@ -42,16 +42,17 @@ deb: clean
 	@echo "==> Building mc-server-tools_$(VERSION)_all.deb"
 	$(MAKE) DESTDIR=$(PKGROOT) install
 	mkdir -p $(DEBIAN_DIR)
-	@cat > $(DEBIAN_DIR)/control <<EOF
-Package: mc-server-tools
-Version: $(VERSION)
-Section: admin
-Priority: optional
-Architecture: all
-Maintainer: $(MAINTAINER)
-Depends: bash, curl, jq, lxc | proxmox-ve
-Description: Minecraft server tools for Proxmox LXC Utilities and scripts to create and manage Minecraft servers in LXC
-EOF
+	@printf '%s\n' \
+		"Package: mc-server-tools" \
+		"Version: $(VERSION)" \
+		"Section: admin" \
+		"Priority: optional" \
+		"Architecture: all" \
+		"Maintainer: $(MAINTAINER)" \
+		"Depends: bash, curl, jq, lxc | proxmox-ve" \
+		"Description: Minecraft server tools for Proxmox LXC" \
+		" Utilities and scripts to create and manage Minecraft servers in LXC." \
+		> $(DEBIAN_DIR)/control
 	dpkg-deb --build $(PKGROOT) ../mc-server-tools_$(VERSION)_all.deb
 	@echo "==> Built ../mc-server-tools_$(VERSION)_all.deb"
 
