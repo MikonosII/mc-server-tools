@@ -208,8 +208,12 @@ else
   SEED=$(seed_port "$EDITION"); PICK=$(next_free_ctid_port "$SEED"); CTID=$PICK; PORT=$PICK
 fi
 
-# Hostname
-if [[ -z "$HN" ]]; then read -r -p "Hostname [mc-$CTID]: " HN; HN=${HN:-mc-$CTID}; fi
+# Hostname (default: MC-<Edition>-<CTID>, e.g. MC-Java-25565)
+DEFAULT_HN="MC-${EDITION}-${CTID}"
+if [[ -z "$HN" ]]; then
+  read -r -p "Hostname [${DEFAULT_HN}]: " HN
+  HN=${HN:-$DEFAULT_HN}
+fi
 
 # right before you call mc-select-template
 [[ -x /usr/share/mc-server-tools/commands/mc-select-template ]] \
