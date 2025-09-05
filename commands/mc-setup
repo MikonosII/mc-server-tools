@@ -157,112 +157,122 @@ _available_templates_catalog() {
 
 # Prompt for a storage (defaults to 'local' if present)
 _choose_storage() {
-  local -a arr; mapfile -t arr < <(_dir_storages)
-  ((${#arr[@]})) || { err "No storages found via pvesm status"; return 1; }
-  local def_idx=1
-  local i
-  for i in "${!arr[@]}"; do [[ "${arr[$i]}" == "local" ]] && def_idx=$((i+1)); done
+  # POSIX-safe: no arrays or process substitution
+  local tmp stor def_idx choice
+  tmp=$(mktemp) || { err "mktemp failed"; return 1; }
+  trap 'rm -f "$tmp"' RETURN
+  _dir_storages > "$tmp"
+  if ! [ -s "$tmp" ]; then err "No storages found via pvesm status"; return 1; fi
+  # Determine default index (prefer 'local' if present)
+  def_idx=$(nl -w1 -s: "$tmp" | awk -F: '$2=="local"{print $1; f=1; exit} END{ if(!f) print 1 }')
   {
-    echo "Storages:"; for i in "${!arr[@]}"; do printf '  %d) %s
-' "$((i+1))" "${arr[$i]}"; done; echo; 
+    echo "Storages:"; nl -w1 -s') ' "$tmp"; echo;
   } >&2
-  local choice
   read -r -p "Choose storage for download [${def_idx}]: " choice
-  if [[ -z "$choice" ]]; then echo "${arr[$((def_idx-1))]}"; return; fi
-  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then echo "${arr[$((choice-1))]}"; return; fi
-  echo "$choice"
+  if [ -z "$choice" ]; then
+    sed -n "${def_idx}p" "$tmp"; return
+  fi
+  if printf '%s
+' "$choice" | grep -Eq '^[0-9]+$'; then
+    sed -n "${choice}p" "$tmp"; return
+  fi
+  printf '%s
+' "$choice"
 }
 
 # Download flow: pick storage & template name from catalog, download, return fully-qualified path
 _download_template_dialog() {
-  local storage name
+  local storage tmp choice name
   storage=$(_choose_storage) || return 1
-  local -a cats; mapfile -t cats < <(_available_templates_catalog)
-  ((${#cats[@]})) || { err "No catalog entries from pveam available"; return 1; }
+  tmp=$(mktemp) || { err "mktemp failed"; return 1; }
+  trap 'rm -f "$tmp"' RETURN
+  _available_templates_catalog > "$tmp"
+  if ! [ -s "$tmp" ]; then err "No catalog entries from pveam available"; return 1; fi
   {
-    echo "Available templates:"; 
-    local show=$(( ${#cats[@]}<20 ? ${#cats[@]} : 20 ))
-    local i; for ((i=0;i<show;i++)); do printf '  %d) %s
-' "$((i+1))" "${cats[$i]}"; done; echo;
+    echo "Available templates (top 20):";
+    head -n 20 "$tmp" | nl -w1 -s') '; echo;
   } >&2
-  local choice
   read -r -p "Download which? (number or full name) [1]: " choice
-  if [[ -z "$choice" ]]; then name="${cats[0]}"; 
-  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#cats[@]} )); then name="${cats[$((choice-1))]}"; 
-  else name="$choice"; fi
+  if [ -z "$choice" ]; then
+    name=$(sed -n '1p' "$tmp")
+  elif printf '%s
+' "$choice" | grep -Eq '^[0-9]+$'; then
+    name=$(sed -n "${choice}p" "$tmp")
+  else
+    name="$choice"
+  fi
+  [ -n "$name" ] || { err "No selection made"; return 1; }
   info "Downloading $name to $storage..."
   pveam download "$storage" "$name"
-  echo "$storage:vztmpl/$name"
+  printf '%s:vztmpl/%s
+' "$storage" "$name"
 }
 
 select_template() {
-  local -a arr; mapfile -t arr < <(installed_templates)
+  # POSIX-safe selection menu; no arrays or process substitution
+  local tmp count def_idx choice sel raw
+  tmp=$(mktemp) || { err "mktemp failed"; exit 1; }
+  trap 'rm -f "$tmp"' RETURN
+  installed_templates > "$tmp"
+  count=$(wc -l < "$tmp" | tr -d ' ')
 
-  if (( ${#arr[@]} == 0 )); then
+  if [ "$count" -eq 0 ]; then
     { echo "No installed templates found."; } >&2
-    local ans
-    read -r -p "Download a template now? [Y/n]: " ans
-    ans=${ans:-Y}
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-      local sel; sel=$(_download_template_dialog) || { err "Download failed"; exit 1; }
+    read -r -p "Download a template now? [Y/n]: " choice
+    choice=${choice:-Y}
+    if printf '%s' "$choice" | grep -Eq '^[Yy]$'; then
+      sel=$(_download_template_dialog) || { err "Download failed"; exit 1; }
       set_config_var DEFAULT_TEMPLATE "$sel"
-      echo "$sel"; return
+      printf '%s
+' "$sel"
+      return
     else
       err "Aborting: no templates installed."; exit 1
     fi
   fi
 
-  { echo "Installed templates:"; local i; for i in "${!arr[@]}"; do printf '  %d) %s
-' "$((i+1))" "${arr[$i]}"; done; echo; } >&2
+  { echo "Installed templates:"; nl -w1 -s') ' "$tmp"; echo; } >&2
 
   # Determine default index ONLY if DEFAULT_TEMPLATE exists and matches
-  local def_idx=""
-  if [[ -n "${DEFAULT_TEMPLATE:-}" ]]; then
-    local idx; for idx in "${!arr[@]}"; do [[ "${arr[$idx]}" == "$DEFAULT_TEMPLATE" ]] && { def_idx=$((idx+1)); break; }; done
-  fi
+  def_idx=$(nl -w1 -s: "$tmp" | awk -F: -v d="${DEFAULT_TEMPLATE:-}" '$2==d{print $1; f=1} END{ if(!f) print "" }')
 
   # Build prompt: require explicit selection if no default
-  local prompt
-  if [[ -n "$def_idx" ]]; then
-    prompt="Choose template [${def_idx}] or 'd' to download: "
+  if [ -n "$def_idx" ]; then
+    read -r -p "Choose template [${def_idx}] or 'd' to download: " choice
   else
-    prompt="Choose template (number) or 'd' to download: "
+    read -r -p "Choose template (number) or 'd' to download: " choice
   fi
 
-  local choice raw sel
   while :; do
-    read -r -p "$prompt" choice
-    if [[ -z "$choice" ]]; then
-      if [[ -n "$def_idx" ]]; then
-        sel="${arr[$((def_idx-1))]}"; break
-      else
-        echo "Please enter a number or 'd' to download." >&2; continue
-      fi
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then
-      sel="${arr[$((choice-1))]}"; break
-    elif [[ "$choice" =~ ^[dD]$ ]]; then
+    if [ -z "$choice" ]; then
+      if [ -n "$def_idx" ]; then sel=$(sed -n "${def_idx}p" "$tmp"); break; fi
+      echo "Please enter a number or 'd' to download." >&2; read -r -p "> " choice; continue
+    fi
+    if printf '%s
+' "$choice" | grep -Eq '^[0-9]+$'; then
+      sel=$(sed -n "${choice}p" "$tmp"); [ -n "$sel" ] || { echo "Invalid number" >&2; read -r -p "> " choice; continue; }; break
+    fi
+    if printf '%s
+' "$choice" | grep -Eq '^[dD]$'; then
       sel=$(_download_template_dialog) || { err "Download failed"; exit 1; }; break
+    fi
+    raw=$choice
+    if printf '%s' "$raw" | grep -q ':vztmpl/'; then
+      if _template_exists "$raw"; then sel="$raw"; break; else echo "Template '$raw' not installed." >&2; read -r -p "> " choice; continue; fi
     else
-      raw=$choice
-      if [[ "$raw" == *":vztmpl/"* ]]; then
-        if _template_exists "$raw"; then sel="$raw"; break; else echo "Template '$raw' not installed." >&2; continue; fi
-      else
-        # Match by filename across installed set
-        local -a matches; matches=()
-        local it
-        for it in "${arr[@]}"; do [[ "${it##*:vztmpl/}" == "$raw" ]] && matches+=("$it"); done
-        if (( ${#matches[@]} == 1 )); then sel="${matches[0]}"; break
-        elif (( ${#matches[@]} > 1 )); then echo "Filename '$raw' is ambiguous; please select by number." >&2; continue
-        else echo "Filename '$raw' not found; select a number or 'd' to download." >&2; continue
-        fi
-      fi
+      # Match by filename across installed set
+      match=$(awk -v fn="$raw" -F':vztmpl/' '$2==fn{print; c++} END{ if(c!=1) print "__AMBIG__" }' "$tmp")
+      if [ "$match" = "__AMBIG__" ]; then echo "Filename '$raw' ambiguous/not found." >&2; read -r -p "> " choice; continue; fi
+      if [ -z "$match" ]; then echo "Filename '$raw' not found." >&2; read -r -p "> " choice; continue; fi
+      sel="$match"; break
     fi
   done
 
   sel=$(printf '%s' "$sel" | tr -d '
 ' | awk '{sub(/[ 	]+$/,""); print}')
   set_config_var DEFAULT_TEMPLATE "$sel"
-  echo "$sel"
+  printf '%s
+' "$sel"
 }
 
 set_config_var() { # $1=KEY $2=VALUE
