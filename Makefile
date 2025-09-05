@@ -51,8 +51,7 @@ uninstall:
 	rm -f $(DESTDIR)$(BIN_DIR)/mc-setup
 	rm -rf $(DESTDIR)$(SHARE_DIR)
 
-deb:
-	deb: clean
+deb: clean
 	@echo "==> Building mc-server-tools_$(VERSION)_all.deb (no changelog, no debhelper)…"
 	# Stage files into package root
 	$(MAKE) DESTDIR=$(PKGROOT) install
@@ -60,7 +59,7 @@ deb:
 	# Control files
 	mkdir -p $(DEBIAN_DIR)
 	# Control metadata (edit Depends if you add more runtime reqs)
-	@cat > $(DEBIAN_DIR)/control << 'EOF'
+	@cat > $(DEBIAN_DIR)/control <<EOF
 Package: mc-server-tools
 Version: $(VERSION)
 Section: admin
