@@ -44,3 +44,27 @@ list_servers() {
     printf "%-18s %-6s %-6s %-10s %-10s\n" "$NAME" "$CTID" "$TYPE" "${IMPL:--}" "$SERVICE_NAME"
   done
 }
+
+
+# --- pretty logging ---
+if [[ -t 2 ]]; then
+  _RED=$'\033[31m'; _YEL=$'\033[33m'; _GRN=$'\033[32m'; _RST=$'\033[0m'
+else
+  _RED=""; _YEL=""; _GRN=""; _RST=""
+fi
+info(){ echo -e "${_GRN}[+]${_RST} $*"; }
+warn(){ echo -e "${_YEL}[!]${_RST} $*" >&2; }
+err(){  echo -e "${_RED}[x]${_RST} $*" >&2; }
+
+# --- guards / validators ---
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    err "This command must be run as root (try: sudo $0 …)"
+    exit 1
+  fi
+}
+
+validate_hhmm() {
+  # HHMM 24-hour time, e.g., 0400
+  [[ "$1" =~ ^([01][0-9]|2[0-3])[0-5][0-9]$ ]]
+}
