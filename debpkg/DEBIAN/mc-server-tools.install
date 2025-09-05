@@ -2,11 +2,8 @@
 lib/common.sh                          usr/share/mc-server-tools/lib/
 lib/preflight.sh                       usr/share/mc-server-tools/lib/
 
-# Commands (kept in our namespace directory)
+# Commands
 commands/mc-setup                      usr/share/mc-server-tools/commands/
 
-# Top-level helpers (user-friendly entry points)
+# Host entry points
 commands/mc-preflight                  usr/bin/
-
-# Optional: ship a wrapper so `mc-setup` is on PATH
-debian/wrappers/mc-setup               usr/bin/
