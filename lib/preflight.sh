@@ -77,12 +77,10 @@ write_apt_sources() {
   local SEC_MIRROR="${SEC_MIRROR:-http://security.ubuntu.com/ubuntu}"
   local DEB_MIRROR="${DEB_MIRROR:-http://deb.debian.org/debian}"
   local DEB_SEC_MIRROR="${DEB_SEC_MIRROR:-http://security.debian.org/debian-security}"
-
   case "$OS_ID" in
     ubuntu)
-      log "Writing Ubuntu mirrors…"
       backup_once /etc/apt/sources.list
-      cat >/etc/apt/sources.list <<EOF
+      cat > /etc/apt/sources.list <<EOF
 deb ${UBU_MIRROR} ${OS_CODENAME} main restricted universe multiverse
 deb ${UBU_MIRROR} ${OS_CODENAME}-updates main restricted universe multiverse
 deb ${UBU_MIRROR} ${OS_CODENAME}-backports main restricted universe multiverse
@@ -90,17 +88,13 @@ deb ${SEC_MIRROR} ${OS_CODENAME}-security main restricted universe multiverse
 EOF
       ;;
     debian)
-      log "Writing Debian mirrors…"
       backup_once /etc/apt/sources.list
-      cat >/etc/apt/sources.list <<EOF
+      cat > /etc/apt/sources.list <<EOF
 deb ${DEB_MIRROR} ${OS_CODENAME} main contrib non-free non-free-firmware
 deb ${DEB_MIRROR} ${OS_CODENAME}-updates main contrib non-free non-free-firmware
 deb ${DEB_MIRROR} ${OS_CODENAME}-backports main contrib non-free non-free-firmware
 deb ${DEB_SEC_MIRROR} ${OS_CODENAME}-security main contrib non-free non-free-firmware
 EOF
-      ;;
-    *)
-      warn "Unknown distro '$OS_ID' — leaving sources.list unchanged."
       ;;
   esac
 }
