@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Ensure we are running under bash even if invoked via sh
+if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 set -euo pipefail
 
 . /usr/share/mc-server-tools/lib/common.sh
@@ -160,7 +162,7 @@ _choose_storage() {
   # POSIX-safe: no arrays or process substitution
   local tmp stor def_idx choice
   tmp=$(mktemp) || { err "mktemp failed"; return 1; }
-  trap 'rm -f "$tmp"' RETURN
+  trap 'rm -f "$tmp"' EXIT
   _dir_storages > "$tmp"
   if ! [ -s "$tmp" ]; then err "No storages found via pvesm status"; return 1; fi
   # Determine default index (prefer 'local' if present)
@@ -185,7 +187,7 @@ _download_template_dialog() {
   local storage tmp choice name
   storage=$(_choose_storage) || return 1
   tmp=$(mktemp) || { err "mktemp failed"; return 1; }
-  trap 'rm -f "$tmp"' RETURN
+  trap 'rm -f "$tmp"' EXIT
   _available_templates_catalog > "$tmp"
   if ! [ -s "$tmp" ]; then err "No catalog entries from pveam available"; return 1; fi
   {
@@ -212,7 +214,7 @@ select_template() {
   # POSIX-safe selection menu; no arrays or process substitution
   local tmp count def_idx choice sel raw
   tmp=$(mktemp) || { err "mktemp failed"; exit 1; }
-  trap 'rm -f "$tmp"' RETURN
+  trap 'rm -f "$tmp"' EXIT
   installed_templates > "$tmp"
   count=$(wc -l < "$tmp" | tr -d ' ')
 
