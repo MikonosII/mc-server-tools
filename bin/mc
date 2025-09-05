@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-# Thin wrapper to the real dispatcher
-exec /usr/bin/mc "$@"
