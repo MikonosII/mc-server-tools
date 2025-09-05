@@ -162,16 +162,23 @@ ctid_exists(){ pct config "$1" >/dev/null 2>&1; }
 port_in_use_host(){ ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
 seed_port(){ [[ ${1:-Java} == Bedrock ]] && echo 19132 || echo 25565; }
 
-next_free_ctid_port(){
-  local start=$1 p=$start
+next_free_ctid_port() {
+  local base="${1:-}"
+  if [[ -z "$base" ]]; then
+    err "Internal: next_free_ctid_port requires a start port"; return 1
+  fi
+  local p="$base"
   while :; do
     if ! ctid_exists "$p" && ! port_in_use_host "$p"; then
       echo "$p"; return 0
     fi
     p=$((p+1))
-    (( p <= 65535 )) || { err "No free CTID/port found above $start"; return 1; }
+    if (( p > 65535 )); then
+      err "No free CTID/port found above $base"; return 1
+    fi
   done
 }
+
 
 # Edition
 if [[ -z "$EDITION" ]]; then read -r -p "Server Edition [Java]: " EDITION; EDITION=${EDITION:-Java}; fi
