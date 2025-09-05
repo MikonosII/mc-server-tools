@@ -5,10 +5,10 @@ BRIDGE="vmbr0"
 
 # ===== Java range (default) =====
 NET_JAVA_START="192.168.205.100"
-NET_JAVA_PREFIX="24"           # CIDR prefix (e.g., 24 for /24)
+NET_JAVA_PREFIX="23"           # CIDR prefix (e.g., 24 for /24)
 NET_JAVA_GW="192.168.202.1"             # "auto" = first host (.1), or set explicit IP
 
 # ===== Bedrock range (default) =====
 NET_BEDROCK_START="192.168.206.100"
-NET_BEDROCK_PREFIX="24"
+NET_BEDROCK_PREFIX="23"
 NET_BEDROCK_GW="192.168.202.1"          # "auto" = first host (.1), or set explicit IP
