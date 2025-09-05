@@ -59,33 +59,34 @@ info "Gateway: $GATEWAY"
 HN_DEFAULT="MC-${EDITION^}-${PORT}"
 HOSTNAME="$(ask "Hostname" "$HN_DEFAULT")"
 
-# Template selection
-TEMPLATE=""
-if command -v pveam >/dev/null 2>&1; then
-  echo "Installed templates:"
-  mapfile -t TEMPLS < <(pveam list local 2>/dev/null | awk '{print $2}' | grep -E '(^|/)((ubuntu|debian).*-standard_.*amd64\.tar\.(zst|xz))$' || true)
-  i=1; for t in "${TEMPLS[@]}"; do echo "$i. local:vztmpl/${t##*/}"; i=$((i+1)); done
-  DEF_INDEX="${DEF_INDEX:-${#TEMPLS[@]}}"
-  read -r -p "Choose template [${DEF_INDEX:-1}] or 'd' to download: " choice || true
-  if [[ "$choice" == [dD] ]]; then
-    if [ -x /usr/share/mc-server-tools/commands/mc-select-template ]; then
-      TEMPLATE="$(/usr/share/mc-server-tools/commands/mc-select-template)"
-    else
-      TEMPLATE="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
-    fi
-    pveam download local "$TEMPLATE"
-    TEMPLATE="local:vztmpl/$TEMPLATE"
+# --- Template selection (delegates to mc-select-template) --------------------
+select_template_ref() {
+  set -euo pipefail
+
+  # Prefer installed helper; fall back to local repo path when developing
+  SEL="/usr/share/mc-server-tools/commands/mc-select-template"
+  [[ -x "$SEL" ]] || SEL="$(dirname "$0")/mc-select-template"
+  [[ -x "$SEL" ]] || { echo "[mc-setup] ERROR: mc-select-template not found"; exit 1; }
+
+  # Pass through any preselection from env/flag
+  # MC_TEMPLATE may be:
+  #   - storage:vztmpl/file.tar.zst   (full ref)
+  #   - file.tar.zst                  (filename only)
+  #   - empty                         (interactive or auto-download in helper)
+  if [[ -n "${MC_TEMPLATE:-}" ]]; then
+    "$SEL" "$MC_TEMPLATE"
   else
-    sel="${choice:-$DEF_INDEX}"
-    TEMPLATE="local:vztmpl/${TEMPLS[$((sel-1))]##*/}"
+    "$SEL"
   fi
-else
-  [ -x /usr/share/mc-server-tools/commands/mc-select-template ] || { err "mc-select-template helper not found"; exit 1; }
-  TEMPLATE="$(
-    /usr/share/mc-server-tools/commands/mc-select-template
-  )"
-  case "$TEMPLATE" in local:*) :;; *) TEMPLATE="local:vztmpl/$TEMPLATE";; esac
-fi
+}
+
+# Get a fully-qualified template reference like: storage:vztmpl/debian-12-standard_*.tar.zst
+TEMPLATE="$(select_template_ref)"
+[ -n "$TEMPLATE" ] || { echo "[mc-setup] ERROR: no template selected"; exit 1; }
+
+# echo "[mc-setup] Using template: $TEMPLATE"
+# -----------------------------------------------------------------------------
+
 
 cat <<EOF
 [INFO] Summary
