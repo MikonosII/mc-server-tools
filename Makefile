@@ -49,6 +49,8 @@ define echo_kv
 endef
 
 .PHONY: all install uninstall clean tree
+.PHONY: deb
+deb: all
 
 all: clean tree
 	$(call echo_kv,VERSION,$(VERSION))
