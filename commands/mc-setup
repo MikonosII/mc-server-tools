@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # mc-setup — create and configure a Minecraft server LXC on Proxmox
-# - Java: installs *official Mojang vanilla* server.jar
+# - Java: installs official Mojang vanilla server.jar
 # - Bedrock: downloads the official azureedge ZIP
 # - Networking: static IPv4 per edition, auto-picks first free IP in subnet
 # - CTID policy: CTID == host port (Java 25565+, Bedrock 19132+)
-# - Templates: requires an *installed* template (storage:vztmpl/file);
-#              persists the last selection as DEFAULT_TEMPLATE in the config.
+# - Templates: selected via helper (mc-select-template), saved as DEFAULT_TEMPLATE
 
-# --- Always run under bash, even if invoked via sh ---
+# Always run under bash even if invoked via sh
 if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 set -euo pipefail
 
@@ -32,23 +31,22 @@ fi
 # shellcheck disable=SC1090
 . "$CONFIG_FILE"
 
-# Default disk size in GiB for pct create (integer, no suffix)
+# Default disk size in GiB (integer, no suffix)
 : "${DISK_GB:=16}"
 
-# --- Small helpers ---
+# --- Config helper ---
 set_config_var() { # $1=KEY $2=VALUE
   local key="$1" val="$2"
   if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
     sed -i "s#^${key}=.*#${key}=\"${val//\//\/}\"#" "$CONFIG_FILE"
   else
-    printf '%s="%s"
-' "$key" "$val" >> "$CONFIG_FILE"
+    printf '%s="%s"\n' "$key" "$val" >> "$CONFIG_FILE"
   fi
 }
 
 validate_numeric() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
-# --- IPv4 math (shell arithmetic, no awk bitops) ---
+# --- IPv4 helpers ---
 ip_to_int(){ IFS=. read -r a b c d <<<"$1"; echo $(( (a<<24) | (b<<16) | (c<<8) | d )); }
 int_to_ip(){ local n=$1; printf '%d.%d.%d.%d' $(((n>>24)&255)) $(((n>>16)&255)) $(((n>>8)&255)) $((n&255)); }
 mask_from_prefix(){ local p=$1; echo $(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF )); }
@@ -56,132 +54,25 @@ network_of(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_fro
 first_host(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_from_prefix "$p"); int_to_ip $(( (ipi & m) + 1 )); }
 broadcast_of(){ local ip=$1 p=$2; local ipi=$(ip_to_int "$ip"); local m=$(mask_from_prefix "$p"); local b=$(( (ipi & m) | ((1 << (32-p)) - 1) )); int_to_ip "$b"; }
 
-# Extract ip= value from a CT's net0, if present
-ct_ip(){ local id=$1; pct config "$id" 2>/dev/null | awk -F'[=, ]' '/^net0:/{for(i=1;i<=NF;i++) if($i=="ip"){print $(i+1)}}'; }
+ct_ip(){
+  local id=$1
+  pct config "$id" 2>/dev/null | awk -F'[=, ]' '/^net0:/{for(i=1;i<=NF;i++) if($i=="ip"){print $(i+1)}}'
+}
 
-# Is IP already in use by any LXC config?
-ip_used_by_cts(){ local ip=$1; while read -r id _; do [[ "$id" =~ ^[0-9]+$ ]] || continue; local nip; nip=$(ct_ip "$id"); [[ "$nip" == "$ip"/* ]] && return 0; done < <(pct list | awk 'NR>1{print $1}'); return 1; }
-
-# Next free host IP starting from SEED in that subnet (skips network & broadcast)
-next_free_ip(){ # $1=seed_ip $2=prefix
-  local seed=$1 pfx=$2
-  local bcast=$(broadcast_of "$seed" "$pfx")
-  local cur_int=$(( $(ip_to_int "$seed") ))
-  local bcast_int=$(( $(ip_to_int "$bcast") ))
-  local first=$(first_host "$seed" "$pfx")
-  local first_int=$(( $(ip_to_int "$first") ))
-  (( cur_int < first_int )) && cur_int=$first_int
-  while (( cur_int < bcast_int )); do
-    local candidate; candidate=$(int_to_ip "$cur_int")
-    if ! ip_used_by_cts "$candidate"; then echo "$candidate"; return 0; fi
-    ((cur_int++))
-  done
+ip_used_by_cts(){ # $1=ip
+  local ip="$1"
+  local id nip
+  while read -r id; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    nip=$(ct_ip "$id")
+    [[ "$nip" == "$ip"/* ]] && return 0
+  done <<EOF
+$(pct list | awk 'NR>1{print $1}')
+EOF
   return 1
 }
 
-# --- Template utilities ---
-installed_templates(){ # outputs lines: storage:vztmpl/file
-  pvesm status 2>/dev/null | awk 'NR>1{print $1}' | while read -r s; do
-    local path
-    if [[ "$s" == "local" ]]; then path=/var/lib/vz/template/cache; else path="/mnt/pve/$s/template/cache"; fi
-    if [[ -d "$path" ]]; then
-      find "$path" -maxdepth 1 -type f -printf '%f
-' 2>/dev/null | while read -r f; do
-        printf '%s:vztmpl/%s
-' "$s" "$f"
-      done
-    fi
-  done
-}
-
-_template_exists(){ # $1=storage:vztmpl/file
-  [[ "$1" == *":vztmpl/"* ]] || return 1
-  local storage="${1%%:vztmpl/*}"; local file="${1##*:vztmpl/}"
-  local cache; [[ "$storage" == "local" ]] && cache=/var/lib/vz/template/cache || cache="/mnt/pve/$storage/template/cache"
-  [[ -f "$cache/$file" ]]
-}
-
-_choose_storage(){ # prints chosen storage
-  local tmp def_idx choice storage
-  tmp=$(mktemp); trap 'rm -f "$tmp"' RETURN
-  pvesm status 2>/dev/null | awk 'NR>1{print $1}' >"$tmp"
-  [[ -s "$tmp" ]] || { err "No storages found via pvesm status"; exit 1; }
-  def_idx=$(nl -w1 -s: "$tmp" | awk -F: '$2=="local"{print $1; f=1; exit} END{ if(!f) print 1 }')
-  { echo "Storages:"; nl -w1 -s') ' "$tmp"; echo; } >&2
-  read -r -p "Choose storage for download [${def_idx}]: " choice
-  if [[ -z "$choice" ]]; then storage=$(sed -n "${def_idx}p" "$tmp");
-  elif [[ "$choice" =~ ^[0-9]+$ ]]; then storage=$(sed -n "${choice}p" "$tmp");
-  else storage="$choice"; fi
-  echo "$storage"
-}
-
-_download_template_dialog(){ # prints storage:vztmpl/file
-  local storage name tmp choice
-  storage=$(_choose_storage)
-  tmp=$(mktemp); trap 'rm -f "$tmp"' RETURN
-  pveam available --section system 2>/dev/null | awk 'NR>1 && $2!="" {print $2}' >"$tmp"
-  [[ -s "$tmp" ]] || { err "No catalog entries from pveam"; exit 1; }
-  { echo "Available templates (top 20):"; head -n 20 "$tmp" | nl -w1 -s') '; echo; } >&2
-  read -r -p "Download which? (number or full name) [1]: " choice
-  if [[ -z "$choice" ]]; then name=$(sed -n '1p' "$tmp");
-  elif [[ "$choice" =~ ^[0-9]+$ ]]; then name=$(sed -n "${choice}p" "$tmp");
-  else name="$choice"; fi
-  [[ -n "$name" ]] || { err "No template selected"; exit 1; }
-  info "Downloading $name to $storage..."; pveam download "$storage" "$name"
-  echo "$storage:vztmpl/$name"
-}
-
-select_template(){ # prints chosen storage:vztmpl/file and persists DEFAULT_TEMPLATE
-  local T_LIST choice sel def_idx
-  T_LIST=$(mktemp); trap 'rm -f "$T_LIST"' RETURN
-  installed_templates >"$T_LIST"
-  local count; count=$(wc -l < "$T_LIST" | tr -d ' ')
-
-  # If user provided fully-qualified and it's installed, accept
-  if [[ -n "${TEMPLATE_IN:-}" && "$TEMPLATE_IN" == *":vztmpl/"* ]] && _template_exists "$TEMPLATE_IN"; then
-    sel="$TEMPLATE_IN"
-  fi
-  # Bare filename match across installed
-  if [[ -z "${sel:-}" && -n "${TEMPLATE_IN:-}" && "$TEMPLATE_IN" != *":vztmpl/"* ]]; then
-    local match
-    match=$(awk -v fn="$TEMPLATE_IN" -F':vztmpl/' '$2==fn{print; c++} END{ if(c==1) exit 0; else exit 1 }' "$T_LIST") || true
-    [[ -n "$match" ]] && sel="$match"
-  fi
-
-  if [[ -z "${sel:-}" && "$count" -eq 0 ]]; then
-    echo "No installed templates found." >&2
-    read -r -p "Download a template now? [Y/n]: " choice; choice=${choice:-Y}
-    if [[ "$choice" =~ ^[Yy]$ ]]; then sel=$(_download_template_dialog); else err "Aborting: no templates installed."; exit 1; fi
-  fi
-
-  if [[ -z "${sel:-}" ]]; then
-    { echo "Installed templates:"; nl -w1 -s') ' "$T_LIST"; echo; } >&2
-    # Default index only if DEFAULT_TEMPLATE matches
-    def_idx=$(nl -w1 -s: "$T_LIST" | awk -F: -v d="${DEFAULT_TEMPLATE:-}" '$2==d{print $1; f=1} END{ if(!f) print "" }')
-    local prompt; if [[ -n "$def_idx" ]]; then prompt="Choose template [${def_idx}] or 'd' to download: "; else prompt="Choose template (number) or 'd' to download: "; fi
-    while :; do
-      read -r -p "$prompt" choice
-      if [[ -z "$choice" ]]; then
-        if [[ -n "$def_idx" ]]; then sel=$(sed -n "${def_idx}p" "$T_LIST"); break; fi
-        echo "Please enter a number or 'd' to download." >&2; continue
-      fi
-      if [[ "$choice" =~ ^[0-9]+$ ]]; then sel=$(sed -n "${choice}p" "$T_LIST"); [[ -n "$sel" ]] || { echo "Invalid number" >&2; continue; }; break; fi
-      if [[ "$choice" =~ ^[dD]$ ]]; then sel=$(_download_template_dialog); break; fi
-      # fully qualified or filename
-      if [[ "$choice" == *":vztmpl/"* ]]; then _template_exists "$choice" && { sel="$choice"; break; } || { echo "Template not installed" >&2; continue; }
-      local match
-      match=$(awk -v fn="$choice" -F':vztmpl/' '$2==fn{print; c++} END{ if(c==1) exit 0; else exit 1 }' "$T_LIST") || true
-      [[ -n "$match" ]] && { sel="$match"; break; } || { echo "Filename not found/ambiguous" >&2; continue; }
-    done
-  fi
-
-  sel=$(printf '%s' "$sel" | tr -d '
-' | awk '{sub(/[ 	]+$/,""); print}')
-  set_config_var DEFAULT_TEMPLATE "$sel"
-  echo "$sel"
-}
-
-# ----- Non-interactive flags -----
+# ----- Flags -----
 EDITION=""; VERSION=""; HN=""; MEM=""; CORES=""; BKT=""; CTID_IN=""; PORT_IN=""; TEMPLATE_IN=""
 while [[ ${1:-} == --* ]]; do
   case "$1" in
@@ -199,206 +90,4 @@ while [[ ${1:-} == --* ]]; do
   esac
 done
 
-# ----- Static IPv4 assignment (no DHCP) -----
-if [[ "${EDITION:-Java}" == "Java" ]]; then
-  IPV4_SEED="${NET_JAVA_START}"; IPV4_PFX="${NET_JAVA_PREFIX:-24}"
-  if [[ "${NET_JAVA_GW:-auto}" == "auto" || -z "${NET_JAVA_GW:-}" ]]; then
-    IPV4_GW="$(first_host "$IPV4_SEED" "$IPV4_PFX")"; [[ "$IPV4_PFX" == "24" ]] && IPV4_GW="$(echo "$IPV4_SEED" | awk -F. '{printf "%d.%d.%d.1",$1,$2,$3}')"
-  else IPV4_GW="$NET_JAVA_GW"; fi
-else
-  IPV4_SEED="${NET_BEDROCK_START}"; IPV4_PFX="${NET_BEDROCK_PREFIX:-24}"
-  if [[ "${NET_BEDROCK_GW:-auto}" == "auto" || -z "${NET_BEDROCK_GW:-}" ]]; then
-    IPV4_GW="$(first_host "$IPV4_SEED" "$IPV4_PFX")"; [[ "$IPV4_PFX" == "24" ]] && IPV4_GW="$(echo "$IPV4_SEED" | awk -F. '{printf "%d.%d.%d.1",$1,$2,$3}')"
-  else IPV4_GW="$NET_BEDROCK_GW"; fi
-fi
-IPV4_ADDR="$(next_free_ip "$IPV4_SEED" "$IPV4_PFX")" || { err "No free IPs in $(network_of "$IPV4_SEED" "$IPV4_PFX")/$IPV4_PFX"; exit 1; }
-
-
-echo "=== Minecraft Server Setup ==="
-
-# --- Simple helpers ---
-ctid_exists(){ pct config "$1" >/dev/null 2>&1; }
-port_in_use_host(){ ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"; }
-seed_port(){ [[ ${1:-Java} == Bedrock ]] && echo 19132 || echo 25565; }
-
-next_free_ctid_port(){ local start=$1 p=$start; while :; do if ! ctid_exists "$p" && ! port_in_use_host "$p"; then echo "$p"; return 0; fi; p=$((p+1)); (( p <= 65535 )) || { err "No free CTID/port above $start"; return 1; }; done }
-
-# Edition
-if [[ -z "${EDITION}" ]]; then read -r -p "Server Edition [Java]: " EDITION; EDITION=${EDITION:-Java}; fi
-if [[ "$EDITION" != "Java" && "$EDITION" != "Bedrock" ]]; then err "Edition must be 'Java' or 'Bedrock'"; exit 1; fi
-
-# Version
-if [[ -z "${VERSION}" ]]; then read -r -p "Minecraft Version [Latest]: " VERSION; VERSION=${VERSION:-Latest}; fi
-
-# Memory
-if [[ -z "${MEM}" ]]; then read -r -p "Memory (MB) [4096]: " MEM; MEM=${MEM:-4096}; fi
-validate_numeric "$MEM" || { err "Memory must be numeric (MB)"; exit 1; }
-
-# Cores
-if [[ -z "${CORES}" ]]; then read -r -p "CPU cores [2]: " CORES; CORES=${CORES:-2}; fi
-validate_numeric "$CORES" || { err "Cores must be numeric"; exit 1; }
-
-# Backup HHMM
-if [[ -z "${BKT}" ]]; then
-  while true; do read -r -p "Daily backup time (HHMM, 24h) [0400]: " BKT; BKT=${BKT:-0400}; if validate_hhmm "$BKT"; then break; else warn "Invalid HHMM. Try again."; fi; done
-else validate_hhmm "$BKT" || { err "Invalid --backup-hhmm (use HHMM)"; exit 1; }
-fi
-
-# --- Auto CTID/Port selection (CTID=Port enforced) ---
-if [[ -n "${CTID_IN}" || -n "${PORT_IN}" ]]; then
-  [[ -z "$CTID_IN" ]] && CTID_IN=$PORT_IN; [[ -z "$PORT_IN" ]] && PORT_IN=$CTID_IN
-  [[ "$CTID_IN" == "$PORT_IN" ]] || { err "CTID and Port must match (CTID=Port policy)."; exit 1; }
-  validate_numeric "$CTID_IN" || { err "CTID/Port must be numeric"; exit 1; }
-  (( CTID_IN >= 1 && CTID_IN <= 65535 )) || { err "CTID/Port must be 1-65535"; exit 1; }
-  ctid_exists "$CTID_IN" && { err "CTID $CTID_IN already exists"; exit 1; }
-  port_in_use_host "$PORT_IN" && { err "Port $PORT_IN is in use on host"; exit 1; }
-  CTID=$CTID_IN; PORT=$PORT_IN
-else
-  SEED=$(seed_port "$EDITION"); PICK=$(next_free_ctid_port "$SEED"); CTID=$PICK; PORT=$PICK
-fi
-
-# Hostname
-if [[ -z "${HN}" ]]; then read -r -p "Hostname [mc-$CTID]: " HN; HN=${HN:-mc-$CTID}; fi
-
-# Template selection (installed-only; persists to config)
-TEMPLATE=$(select_template)
-
-# RootFS storage (prefer local-lvm, else local)
-STOR=$(pvesm status 2>/dev/null | awk 'NR>1 && $1=="local-lvm"{print $1}' | head -n1)
-STOR=${STOR:-local}
-
-info "Summary"
-echo "CTID:      $CTID"
-echo "Hostname:  $HN"
-echo "Edition:   $EDITION"
-echo "Version:   $VERSION"
-echo "Memory:    ${MEM}MB"
-echo "Cores:     $CORES"
-echo "IPv4:      ${IPV4_ADDR}/${IPV4_PFX}  gw ${IPV4_GW}"
-echo "Port:      $PORT"
-echo "Template:  $TEMPLATE"
-echo "Disk:      ${DISK_GB}G on $STOR"
-echo "Autostart: Yes (always)"
-echo "Backups:   Daily @ ${BKT:0:2}:${BKT:2:2}"
-
-info "Creating container CT $CTID..."
-pct create "$CTID" "$TEMPLATE" \
-  -hostname "$HN" \
-  -cores "$CORES" \
-  -memory "$MEM" \
-  -swap 0 \
-  -net0 "name=eth0,bridge=${BRIDGE},ip=${IPV4_ADDR}/${IPV4_PFX},gw=${IPV4_GW}" \
-  -rootfs "$STOR:${DISK_GB}" \
-  -unprivileged 1 \
-  -onboot 1
-
-info "Starting CT $CTID..."; pct start "$CTID"
-
-if [[ "$EDITION" == "Java" ]]; then
-  info "Installing Java (official Mojang vanilla) and server jar (as mcadmin)..."
-  pct exec "$CTID" -- env MC_VER="$VERSION" bash -lc '
-    set -e
-    apt-get update
-    apt-get install -y openjdk-21-jre-headless curl jq screen
-    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
-    install -d -o mcadmin -g mcadmin /opt/minecraft
-    cd /opt/minecraft
-    VER="${MC_VER:-Latest}"
-    if [[ "$VER" == "Latest" || "$VER" == "latest" ]]; then
-      VER=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r '.latest.release')
-    fi
-    MANIFEST_URL=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg v "$VER" '.versions[] | select(.id==$v) | .url' | head -n1)
-    if [[ -z "$MANIFEST_URL" || "$MANIFEST_URL" == "null" ]]; then
-      echo "Requested version $VER not found; falling back to latest release" >&2
-      VER=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r '.latest.release')
-      MANIFEST_URL=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg v "$VER" '.versions[] | select(.id==$v) | .url' | head -n1)
-    fi
-    JAR_URL=$(curl -fsSL "$MANIFEST_URL" | jq -r '.downloads.server.url')
-    curl -fSL -o server.jar "$JAR_URL"
-    echo "eula=true" > eula.txt
-    chown -R mcadmin:mcadmin /opt/minecraft
-  '
-
-  info "Creating start script and service (runs as mcadmin)..."
-  pct exec "$CTID" -- bash -lc "cat >/usr/local/bin/mc-start << 'EOS'
-#!/usr/bin/env bash
-set -e
-cd /opt/minecraft
-# keep session name \"mc\" for compatibility with tooling
-su -s /bin/bash - mcadmin -c \"screen -dmS mc java -Xms512M -Xmx${MEM}M -jar server.jar nogui\"
-EOS
-chmod +x /usr/local/bin/mc-start"
-
-  pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service << "EOF"
-[Unit]
-Description=Minecraft Server (Vanilla)
-After=network.target
-
-[Service]
-Type=forking
-User=root
-ExecStart=/usr/local/bin/mc-start
-ExecStop=/usr/bin/screen -S mc -p 0 -X stuff "stop^M"
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable minecraft.service'
-
-else
-  info "Setting up Bedrock (as mcadmin)"
-  pct exec "$CTID" -- bash -lc '
-    set -e
-    apt-get update
-    apt-get install -y unzip curl screen
-    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
-    install -d -o mcadmin -g mcadmin /opt/bedrock
-    cd /opt/bedrock
-    BEDROCK_URL=$(curl -fsSL https://www.minecraft.net/en-us/download/server/bedrock | grep -oE "https://minecraft\.azureedge\.net/bin-linux/bedrock-server-[0-9\.]+\.zip" | head -n1)
-    if [[ -z "$BEDROCK_URL" ]]; then echo "Failed to detect Bedrock server URL" >&2; exit 1; fi
-    curl -fsSL -o bedrock-server.zip "$BEDROCK_URL"
-    unzip -o bedrock-server.zip
-    chown -R mcadmin:mcadmin /opt/bedrock
-  '
-
-  info "Creating start script and service (runs as mcadmin)..."
-  pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start << "EOS"
-#!/usr/bin/env bash
-set -e
-cd /opt/bedrock
-# keep session name "mc" for tooling compatibility
-su -s /bin/bash - mcadmin -c "cd /opt/bedrock; screen -dmS mc env LD_LIBRARY_PATH=. ./bedrock_server"
-EOS
-chmod +x /usr/local/bin/mc-start
-
-cat >/etc/systemd/system/minecraft.service << "EOF"
-[Unit]
-Description=Minecraft Bedrock Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=forking
-User=root
-ExecStart=/usr/local/bin/mc-start
-ExecStop=/usr/bin/screen -S mc -p 0 -X stuff "stop^M"
-Restart=on-failure
-RestartSec=5s
-TimeoutStopSec=30s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable minecraft.service'
-fi
-
-# --- Backups via host cron (vzdump) ---
-H=${BKT:0:2}; M=${BKT:2:2}
-CRONFILE="/etc/cron.d/mc-server-${CTID}"
-echo "$M $H * * * root /usr/bin/mc backup $CTID" > "$CRONFILE"
-chmod 0644 "$CRONFILE"
-
-info "Done! Use: mc start $CTID | mc logs $CTID | mc console $CTID | mc stop $CTID | mc backup $CTID | mc list"
+# ----- Stat
