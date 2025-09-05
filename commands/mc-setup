@@ -271,6 +271,20 @@ pct create "$CTID" "$TEMPLATE" \
 
 info "Starting CT $CTID..."; pct start "$CTID"
 
+# Sanity check: gateway ping from inside the CT
+info "Checking gateway $IPV4_GW from inside CT $CTID..."
+if ! pct exec "$CTID" -- ping -c1 -W2 "$IPV4_GW" >/dev/null 2>&1; then
+  warn "Inside CT $CTID: gateway $IPV4_GW did not respond to ping."
+  warn "Networking may not work (apt-get could hang)."
+  read -r -p "Continue anyway? [y/N]: " yn
+  case "$yn" in
+    [Yy]*) ;;
+    *) err "Aborting due to unreachable gateway inside CT"; exit 1;;
+  esac
+else
+  info "Gateway $IPV4_GW is reachable from inside CT $CTID"
+fi
+
 if [[ $EDITION == "Java" ]]; then
   info "Installing Java (official Mojang vanilla) and server jar (as mcadmin)..."
   pct exec "$CTID" -- env MC_VER="$VERSION" bash -lc '
