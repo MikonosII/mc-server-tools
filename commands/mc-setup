@@ -215,34 +215,49 @@ select_template() {
   { echo "Installed templates:"; local i; for i in "${!arr[@]}"; do printf '  %d) %s
 ' "$((i+1))" "${arr[$i]}"; done; echo; } >&2
 
-  # Default from config if present and matches; otherwise first entry
-  local def_idx=1
+  # Determine default index ONLY if DEFAULT_TEMPLATE exists and matches
+  local def_idx=""
   if [[ -n "${DEFAULT_TEMPLATE:-}" ]]; then
     local idx; for idx in "${!arr[@]}"; do [[ "${arr[$idx]}" == "$DEFAULT_TEMPLATE" ]] && { def_idx=$((idx+1)); break; }; done
   fi
 
-  local choice raw sel
-  read -r -p "Choose template [${def_idx}] or 'd' to download: " choice
-  if [[ -z "$choice" ]]; then
-    sel="${arr[$((def_idx-1))]}"
-  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then
-    sel="${arr[$((choice-1))]}"
-  elif [[ "$choice" =~ ^[dD]$ ]]; then
-    sel=$(_download_template_dialog) || { err "Download failed"; exit 1; }
+  # Build prompt: require explicit selection if no default
+  local prompt
+  if [[ -n "$def_idx" ]]; then
+    prompt="Choose template [${def_idx}] or 'd' to download: "
   else
-    raw=$choice
-    if [[ "$raw" == *":vztmpl/"* ]]; then
-      _template_exists "$raw" || { err "Template '$raw' not installed"; exit 1; }
-      sel="$raw"
-    else
-      # Match by filename across installed set
-      local -a matches; matches=()
-      local fn; fn="$raw"
-      local it
-      for it in "${arr[@]}"; do [[ "${it##*:vztmpl/}" == "$fn" ]] && matches+=("$it"); done
-      if (( ${#matches[@]} == 1 )); then sel="${matches[0]}"; else err "Template '$fn' ambiguous/not found"; exit 1; fi
-    fi
+    prompt="Choose template (number) or 'd' to download: "
   fi
+
+  local choice raw sel
+  while :; do
+    read -r -p "$prompt" choice
+    if [[ -z "$choice" ]]; then
+      if [[ -n "$def_idx" ]]; then
+        sel="${arr[$((def_idx-1))]}"; break
+      else
+        echo "Please enter a number or 'd' to download." >&2; continue
+      fi
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then
+      sel="${arr[$((choice-1))]}"; break
+    elif [[ "$choice" =~ ^[dD]$ ]]; then
+      sel=$(_download_template_dialog) || { err "Download failed"; exit 1; }; break
+    else
+      raw=$choice
+      if [[ "$raw" == *":vztmpl/"* ]]; then
+        if _template_exists "$raw"; then sel="$raw"; break; else echo "Template '$raw' not installed." >&2; continue; fi
+      else
+        # Match by filename across installed set
+        local -a matches; matches=()
+        local it
+        for it in "${arr[@]}"; do [[ "${it##*:vztmpl/}" == "$raw" ]] && matches+=("$it"); done
+        if (( ${#matches[@]} == 1 )); then sel="${matches[0]}"; break
+        elif (( ${#matches[@]} > 1 )); then echo "Filename '$raw' is ambiguous; please select by number." >&2; continue
+        else echo "Filename '$raw' not found; select a number or 'd' to download." >&2; continue
+        fi
+      fi
+    fi
+  done
 
   sel=$(printf '%s' "$sel" | tr -d '
 ' | awk '{sub(/[ 	]+$/,""); print}')
@@ -491,38 +506,51 @@ pct create "$CTID" "$TEMPLATE" \
 info "Starting CT $CTID..."; pct start "$CTID"
 
 if [[ $EDITION == "Java" ]]; then
-  info "Installing Java and server jar (as mcadmin)..."
-  pct exec "$CTID" -- bash -lc '
-    set -e
-    apt-get update
-    apt-get install -y openjdk-21-jre-headless curl screen
-    id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
-    install -d -o mcadmin -g mcadmin /opt/minecraft
-    cd /opt/minecraft
-    curl -fsSL -o server.jar https://launcher.mojang.com/v1/objects/fe9f03f1f2b44f2d6a6f1a/server.jar || true
-    echo "eula=true" > /opt/minecraft/eula.txt
-    chown -R mcadmin:mcadmin /opt/minecraft
-  '
+  info "Installing Java (official Mojang vanilla) and server jar (as mcadmin)..."
+pct exec "$CTID" -- env MC_VER="$VERSION" bash -lc '
+  set -e
+  apt-get update
+  apt-get install -y openjdk-21-jre-headless curl jq screen
+  id -u mcadmin >/dev/null 2>&1 || useradd -m -s /bin/bash mcadmin
+  install -d -o mcadmin -g mcadmin /opt/minecraft
+  cd /opt/minecraft
+  VER="${MC_VER:-Latest}"
+  # Resolve requested version to an official server JAR URL
+  if [[ "$VER" == "Latest" || "$VER" == "latest" ]]; then
+    VER=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r '.latest.release')
+  fi
+  MANIFEST_URL=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg v "$VER" '.versions[] | select(.id==$v) | .url' | head -n1)
+  if [[ -z "$MANIFEST_URL" || "$MANIFEST_URL" == "null" ]]; then
+    echo "Requested version $VER not found; falling back to latest release" >&2
+    VER=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r '.latest.release')
+    MANIFEST_URL=$(curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json | jq -r --arg v "$VER" '.versions[] | select(.id==$v) | .url' | head -n1)
+  fi
+  JAR_URL=$(curl -fsSL "$MANIFEST_URL" | jq -r '.downloads.server.url')
+  curl -fSL -o server.jar "$JAR_URL"
+  echo "eula=true" > eula.txt
+  chown -R mcadmin:mcadmin /opt/minecraft
+'
 
-  info "Creating start script and service (runs as mcadmin)..."
-  pct exec "$CTID" -- bash -lc 'cat >/usr/local/bin/mc-start << EOS
+info "Creating start script and service (runs as mcadmin)..."
+  pct exec "$CTID" -- bash -lc "cat >/usr/local/bin/mc-start << 'EOS'
 #!/usr/bin/env bash
 set -e
 cd /opt/minecraft
-# keep session name "mc" for compatibility with tooling
-su -s /bin/bash - mcadmin -c "screen -dmS mc java -Xms512M -Xmx${MEM}M -jar server.jar nogui"
+# keep session name \"mc\" for compatibility with tooling
+su -s /bin/bash - mcadmin -c \"screen -dmS mc java -Xms512M -Xmx${MEM}M -jar server.jar nogui\"
 EOS
-chmod +x /usr/local/bin/mc-start'
+chmod +x /usr/local/bin/mc-start"
 
   pct exec "$CTID" -- bash -lc 'cat >/etc/systemd/system/minecraft.service << "EOF"
 [Unit]
-Description=Minecraft Server
+Description=Minecraft Server (Vanilla)
 After=network.target
 
 [Service]
 Type=forking
 User=root
 ExecStart=/usr/local/bin/mc-start
+ExecStop=/usr/bin/screen -S mc -p 0 -X stuff "stop^M"
 Restart=on-failure
 
 [Install]
